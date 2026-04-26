@@ -349,7 +349,7 @@ class UAVNavigationEnv(gym.Env):
         # 碰撞判定距离 = obstacle_rho + uav_rho
         # 原始值 120+60=180px=1.8格, 碰撞直径3.6格 → 250步存活率≈0%
         # 调整后 40+20=60px=0.6格, 碰撞直径1.2格 → 250步存活率≈20%
-        num_obstacles=2,
+        num_obstacles=1,
         obstacle_speed=20.0,       # 慢速更易预测和规避
         obstacle_rho=40.0,         # 障碍物安全半径
         uav_rho=20.0,              # UAV 安全半径
@@ -975,22 +975,87 @@ class UAVNavigationEnv(gym.Env):
         noisy = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
         return noisy
 
-    def _compute_safety_mask(self, pos):
+    def _compute_safety_mask(self, pos, margin_cells=2.5, release_radius=8.0):
         """
-        计算 8 方向安全掩码 σ_t ∈ {0,1}^8.
-        σ_t[i] = 1 表示方向 i 不出界, 0 表示出界.
+        计算 8 方向"距边界软安全度" σ_t ∈ [0, 1]^8.
 
-        说明:
-          - 仅做边界检查, 不再考虑 M^trv / M^occ.
-          - 障碍物规避完全交给 reward signal + 语义地图观测自学习.
-          - Agent 远离边缘时该 mask 退化为全 1, 编码层会逐渐忽略该分支.
+        定义:
+            σ_t[i] = clip(k_to_wall_along_dir_i / margin_cells, 0, 1)
+
+        其中 k_to_wall_along_dir_i 是沿方向 i 走到边界还需要的轴向格数
+        (浮点, 单位: cell), 取 x/y 两轴中先撞墙的那一轴的格数.
+
+        与原版 (二值出界检查) 对比:
+            * 原版: 下一步出界 → 0, 否则 1     (反应窗口 = 1 步, 离散信号)
+            * 新版: σ ∈ [0, 1] 连续衰减       (margin=2.5 → 提前 2-3 步预警)
+
+        margin_cells = 2.5 的取值理由:
+            * 太小 (<1.5) 信号衰减太快, 与原版差异不大
+            * 太大 (>4) 大部分时间 < 1, agent 学不到"哪里完全安全"
+            * 2.5 给 ε-greedy 探索充足反应窗口, 网格中心仍稳定 ≈ 1.0
+
+        ─── target 附近的 mask 自动解除 (release_radius) ──────────────
+        如果 target 本身就在边界附近, 边界警告会与 target 吸引信号冲突 —
+        encoder 学到"低 σ → 危险"的先验后, 即使 task reward 指示该贴近,
+        agent 也会回避, 导致"边界 target 找不到"的失败模式.
+
+        修复: 用切比雪夫距离判断到 target 的远近 (与 reach_radius 同口径),
+        距离 ≤ release_radius 时, mask 渐变向全 1 (无警告) 收敛:
+            fade = 1.0 - cheb / release_radius     (cheb=0 → fade=1, cheb=R → fade=0)
+            σ_t' = σ_t + (1 - σ_t) · fade
+
+        release_radius = 7.0 的取值理由:
+            * reach_radius = 5 (到达判定切比雪夫半径)
+            * margin_cells = 2.5 (mask 预警半径)
+            * release_radius = reach_radius + margin ≈ 7 — 在"开始要够 target"
+              的距离上就开始解除警告, 给 agent 完整的接近窗口
+            * 内圈 (cheb ≤ 5) 相当于已经在 reach 区附近, mask 几乎全 1
+            * 外圈 (cheb > 7) 完全保留边界警告
+
+        范围与语义:
+            * σ = 0     —— 已贴墙, 且远离 target — 强警告
+            * σ = 0.4   —— 距墙 1 格, 远离 target — 中等警告 (margin=2.5)
+            * σ = 1.0   —— 远离边界, 或正在接近 target — 完全放行
+
+        作用域:
+            * 仅描述边界, 不混入 M^trv / M^occ — 障碍物风险已由
+              forecast head + risk-aware reward (公式 28) 专门处理.
+            * 不进入 reward / 碰撞判定 / 动力学 — 仅作为 encoder 的额外输入,
+              因此向后兼容: 同种子下采样轨迹不变, 仅 encoder 输入分布改变.
         """
         mask = np.ones(8, dtype=np.float32)
         for i, d in enumerate(self._dir8):
-            next_pos = pos + d * self.cell_size
-            # 出界检查
-            if not (0 <= next_pos[0] <= self.D and 0 <= next_pos[1] <= self.D):
-                mask[i] = 0.0
+            # 沿方向 d 到达边界还需要走多少格 (轴向格数)
+            # 解 0 ≤ pos[axis] + d[axis]*k*cell_size ≤ D, k > 0 取最小正解
+            ks = []
+            if d[0] > 0:
+                ks.append((self.D - pos[0]) / (d[0] * self.cell_size))
+            elif d[0] < 0:
+                ks.append(pos[0] / (-d[0] * self.cell_size))
+            if d[1] > 0:
+                ks.append((self.D - pos[1]) / (d[1] * self.cell_size))
+            elif d[1] < 0:
+                ks.append(pos[1] / (-d[1] * self.cell_size))
+            # 注意: d[axis] ∈ {-1, 0, +1}, 上述公式得到的 k 是"到墙的轴向格数".
+            # 对角方向 (|d|=√2) 时, x/y 两轴各自的 k 取 min — 谁先撞墙听谁的.
+            k_to_wall = min(ks) if ks else float('inf')   # 中心方向无墙时无穷
+            # 数值保护: 边界外 (clip 之前 k 可能为负) → clip 兜底为 0.
+            mask[i] = float(np.clip(k_to_wall / margin_cells, 0.0, 1.0))
+
+        # ─── target 附近 mask 渐变解除 ─────────────────────────────────
+        # 用切比雪夫距离 (与到达判定 reach_radius 同口径).
+        # 注意: 仅当 target_pos 已被设置时执行 (reset 之后才有效);
+        # 早期 reset 前的极少数调用如果没有 target_pos 属性, 跳过解除以兼容.
+        if hasattr(self, 'target_pos') and self.target_pos is not None:
+            dx = abs(pos[0] - self.target_pos[0]) / self.cell_size
+            dy = abs(pos[1] - self.target_pos[1]) / self.cell_size
+            cheb = max(dx, dy)
+            if cheb <= release_radius:
+                # fade ∈ [0, 1]: 距 target 越近 fade 越大, mask 被往 1 拉
+                fade = 1.0 - cheb / release_radius
+                # 凸组合: σ' = σ + (1-σ)·fade — fade=1 时 σ'=1 (完全解除)
+                mask = mask + (1.0 - mask) * fade
+                mask = np.clip(mask, 0.0, 1.0).astype(np.float32)
         return mask
 
     def _get_obs(self):
