@@ -45,7 +45,7 @@ parser.add_argument('--env', type=str, default='UAV-v0',
                     choices=GYM_ENVS + CONTROL_SUITE_ENVS + ['UAV-v0'])
 parser.add_argument('--symbolic-env', action='store_true')
 parser.add_argument('--max-episode-length', type=int, default=100)
-parser.add_argument('--experience-size', type=int, default=1000000,
+parser.add_argument('--experience-size', type=int, default=500000,
                     help='Replay buffer size')
 parser.add_argument('--action-repeat', type=int, default=1)
 parser.add_argument('--bit-depth', type=int, default=5)
@@ -103,7 +103,21 @@ metrics = {
     'steps': [], 'episodes': [], 'train_rewards': [],
     'test_episodes': [], 'test_rewards': [], 'test_avg_rewards': [],
     'q_loss': [],
+    # ─── [训练 SR/CR] 训练阶段成功率 / 碰撞率 ──────────────────────────
+    # train_success / train_collision: 每 episode 二值标签 (0/1),
+    #   口径与评估完全一致 — 严格读 env._last_info, 不再做 reward 阈值反推.
+    # train_sr / train_cr: 最近 TRAIN_METRIC_WINDOW (=100) 个 episodes 的
+    #   滑动平均 (%), 用于平滑 0/1 脉冲、和 main.py / Eval 指标对齐.
+    'train_success': [],
+    'train_collision': [],
+    'train_sr': [],
+    'train_cr': [],
 }
+
+# [训练 SR/CR] 滑动窗口大小 (episodes). 与 main.py 保持一致, 100 是常用经验值:
+# 既能压住 DRL 训练的高方差, 又不会过度滞后. 评估周期 args.test_episodes ≈ 10,
+# 滑动 100 ≈ 把 ~10 个评估周期的成功事件平均到一起, 量级匹配.
+TRAIN_METRIC_WINDOW = 100
 
 writer = SummaryWriter(results_dir + "/{}_{}_log".format(args.env, args.id))
 print("Writer is ready.")
@@ -386,15 +400,28 @@ D = D3QNReplayBuffer(args.experience_size, env.observation_size,
 if not args.test:
     for s in range(1, args.seed_episodes + 1):
         observation, done, t = env.reset(), False, 0
+        # [训练 SR/CR] 与正式训练 rollout (run_episode) 同口径: 累积 reach/collision 标志.
+        # 此处不复用 run_episode 是因为种子阶段无 agent, 用 sample_random_action.
+        _seed_reached = False
+        _seed_collided = False
+        _seed_inner = env._env if hasattr(env, '_env') else env
         while not done:
             action = env.sample_random_action()
             next_observation, reward, done = env.step(action)
             D.append(observation, action, reward, next_observation, done)
             observation = next_observation
             t += 1
+            _info = getattr(_seed_inner, '_last_info', {}) or {}
+            if _info.get('reach', False):
+                _seed_reached = True
+            if _info.get('collision', False):
+                _seed_collided = True
         metrics['steps'].append(t * args.action_repeat +
                                 (0 if len(metrics['steps']) == 0 else metrics['steps'][-1]))
         metrics['episodes'].append(s)
+        # [训练 SR/CR] 二值事件; 滑动平均统一在主训练循环里算.
+        metrics['train_success'].append(1 if _seed_reached else 0)
+        metrics['train_collision'].append(1 if _seed_collided else 0)
 print("Experience replay buffer is ready. (size={})".format(len(D)))
 
 
@@ -466,15 +493,11 @@ def run_episode(env, agent, epsilon, train=False):
                 if d < min_clearance:
                     min_clearance = d
 
-        # 到达/碰撞判定 (优先 info dict, 回退 reward 阈值)
+        # 到达/碰撞判定: 严格读取 env._last_info, 不再做 reward 阈值反推.
+        # 原因: reward_collision == reward_boundary == -10, 单看 reward
+        # 无法区分撞障碍物与出界, fallback 会把出界误记为 collision.
+        # _last_info 缺失时 (异常 wrapper / mock env) 该 step 不计入任何指标.
         _info = getattr(_inner, '_last_info', {}) or {}
-        if not _info:
-            _rt = getattr(_inner, 'reward_reach', 100.0)
-            _rc = getattr(_inner, 'reward_collision', -10.0)
-            if r_val >= _rt * 0.9:
-                _info = {'reach': True}
-            if r_val <= _rc * 0.9:
-                _info['collision'] = True
         if _info.get('reach', False):
             reached = True
         if _info.get('collision', False):
@@ -522,14 +545,8 @@ def run_test_episode(env, agent, map_seed, ood):
                 if d < min_clearance:
                     min_clearance = d
 
+        # [同上] 严格读 _last_info, 无 reward fallback.
         _info = getattr(_inner, '_last_info', {}) or {}
-        if not _info:
-            _rt = getattr(_inner, 'reward_reach', 100.0)
-            _rc = getattr(_inner, 'reward_collision', -10.0)
-            if r_val >= _rt * 0.9:
-                _info = {'reach': True}
-            if r_val <= _rc * 0.9:
-                _info['collision'] = True
         if _info.get('reach', False):
             reached = True
         if _info.get('collision', False):
@@ -598,7 +615,9 @@ for episode in tqdm(range(start_episode, args.episodes + 1),
             sr     = float(np.mean([r['SR']     for r in ep_records]))
             cr     = float(np.mean([r['CR']     for r in ep_records]))
             aplrs  = [r['APLR']  for r in ep_records if not np.isnan(r['APLR'])]
-            aplr   = float(np.mean(aplrs)) if aplrs else 0.0
+            # [APLR NaN 修复] 没人到达 → aplrs 为空, APLR 在此 batch 上"无定义", 记 NaN 不记 0.
+            # 0 会被 lineplot 当成有效点画出"训练初期 APLR 跌到 0"的误导性曲线.
+            aplr   = float(np.mean(aplrs)) if aplrs else float('nan')
             mclrs  = [r['MinClr'] for r in ep_records if r['MinClr'] > 0]
             minclr = float(np.mean(mclrs)) if mclrs else 0.0
             avg_rw = float(np.mean([r['Reward'] for r in ep_records]))
@@ -682,15 +701,38 @@ for episode in tqdm(range(start_episode, args.episodes + 1),
     metrics['episodes'].append(episode)
     metrics['train_rewards'].append(total_reward)
 
+    # ─── [训练 SR/CR] 写入 metrics + 滑动平均 + TensorBoard + 绘图 ───
+    # run_episode 已经返回 reached/collided, 直接复用. 不再读 _last_info.
+    metrics['train_success'].append(1 if ep_stats['reached'] else 0)
+    metrics['train_collision'].append(1 if ep_stats['collided'] else 0)
+
+    # 滑动窗口: 取最近 TRAIN_METRIC_WINDOW 个 episodes 平均.
+    # 训练初期不足窗口长度时, 用全部已有 episodes (从 seed_episodes 起).
+    _win = min(TRAIN_METRIC_WINDOW, len(metrics['train_success']))
+    _train_sr = float(np.mean(metrics['train_success'][-_win:])) * 100.0
+    _train_cr = float(np.mean(metrics['train_collision'][-_win:])) * 100.0
+    metrics['train_sr'].append(_train_sr)
+    metrics['train_cr'].append(_train_cr)
+
     writer.add_scalar('Train/episode_reward', total_reward, episode)
     writer.add_scalar('Train/epsilon', eps, episode)
     writer.add_scalar('Train/episode_length', ep_stats['steps'], episode)
+    # [训练 SR/CR] 双轨记录: 瞬时事件 (0/1, 调试用) + 滑动平均 (%, 趋势用).
+    writer.add_scalar('Train/Success',   metrics['train_success'][-1],   episode)
+    writer.add_scalar('Train/Collision', metrics['train_collision'][-1], episode)
+    writer.add_scalar('Train/SR', _train_sr, episode)
+    writer.add_scalar('Train/CR', _train_cr, episode)
 
     lineplot(metrics['episodes'][-len(metrics['train_rewards']):],
              metrics['train_rewards'], 'Train Rewards', results_dir)
+    # [训练 SR/CR] 训练成功率 / 碰撞率曲线
+    _sr_x = metrics['episodes'][-len(metrics['train_sr']):]
+    lineplot(_sr_x, metrics['train_sr'], 'Train SR', results_dir)
+    lineplot(_sr_x, metrics['train_cr'], 'Train CR', results_dir)
 
     print(f"  ep={episode} reward={total_reward:.1f} steps={ep_stats['steps']} "
           f"reached={ep_stats['reached']} collided={ep_stats['collided']} "
+          f"SR={_train_sr:.1f}% CR={_train_cr:.1f}% "
           f"ε={eps:.3f} q_loss={mean_q_loss:.4f}")
 
     # ── 4. Checkpoint ─────────────────────────────────────────────────────
@@ -777,14 +819,24 @@ for _i, _rec in enumerate(_final_eval_results['ood'], 1):
 # ── 汇总平均行 ──────────────────────────────────────────────────────────────
 def _mean_ignore_nan(vals):
     vs = [v for v in vals if v is not None and not (isinstance(v, float) and np.isnan(v))]
-    return float(np.mean(vs)) if vs else 0.0
+    # [APLR NaN 修复] 全空 → NaN, 不再返回 0.
+    # 全空意味着 "整组评测都没产生这个指标的有效样本" (例如 in-domain 全失败 → APLR 全 NaN),
+    # 此时返回 0 会让 Table I 出现 "APLR=0.000" 这种比"完美最短路"还离谱的数值,
+    # 直接误导读者. NaN 在 print 中显示为 "nan", 在 TensorBoard scalar 写入时被自动跳过.
+    return float(np.mean(vs)) if vs else float('nan')
 
 _id_recs = _final_eval_results['in_domain']
 _od_recs = _final_eval_results['ood']
 
-avg_SR      = _mean_ignore_nan([r['SR']     for r in _id_recs])
+# ─── [Table I 数据源变更] SR (%)↑ / CR (%)↓ 改用训练 SR/CR (滑动 100 ep 平均) ───
+# 与 main.py 保持完全一致的口径, 保证 baseline (D3QN) 与主框架 (WM+D3QN) 数据可比.
+# 详见 main.py 同位置注释.
+avg_SR_indomain = _mean_ignore_nan([r['SR'] for r in _id_recs])
+avg_CR_indomain = _mean_ignore_nan([r['CR'] for r in _id_recs])
+avg_SR = metrics['train_sr'][-1] if metrics['train_sr'] else float('nan')
+avg_CR = metrics['train_cr'][-1] if metrics['train_cr'] else float('nan')
+
 avg_APLR    = _mean_ignore_nan([r['APLR']   for r in _id_recs])
-avg_CR      = _mean_ignore_nan([r['CR']     for r in _id_recs])
 avg_MinClr  = _mean_ignore_nan([r['MinClr'] for r in _id_recs])
 avg_SR_OOD  = _mean_ignore_nan([r['SR']     for r in _od_recs])
 avg_CR_OOD  = _mean_ignore_nan([r['CR']     for r in _od_recs])
@@ -795,9 +847,9 @@ avg_Rew_all = _mean_ignore_nan([r['Reward'] for r in _id_recs + _od_recs])
 print("\n" + "=" * 92)
 print(" Paper Table I — D3QN Baseline — Averaged over all test episodes")
 print("=" * 92)
-print("  SR (%)↑          = {:>7.2f}".format(avg_SR))
+print("  SR (%)↑          = {:>7.2f}    [train, sliding-{} ep]".format(avg_SR, TRAIN_METRIC_WINDOW))
 print("  APLR↓            = {:>7.3f}".format(avg_APLR))
-print("  CR (%)↓          = {:>7.2f}".format(avg_CR))
+print("  CR (%)↓          = {:>7.2f}    [train, sliding-{} ep]".format(avg_CR, TRAIN_METRIC_WINDOW))
 print("  MinClr↑          = {:>7.2f}".format(avg_MinClr))
 print("  Occ-IoU↑         =    -     (N/A for D3QN)")
 print("  ADE↓             =    -     (N/A for D3QN)")
@@ -805,6 +857,8 @@ print("  FDE↓             =    -     (N/A for D3QN)")
 print("  SR-OOD (%)↑      = {:>7.2f}".format(avg_SR_OOD))
 print("  CR-OOD (%)↓      = {:>7.2f}".format(avg_CR_OOD))
 print("  --------------------------------")
+print("  [aux] In-Domain Eval SR  = {:>7.2f}".format(avg_SR_indomain))
+print("  [aux] In-Domain Eval CR  = {:>7.2f}".format(avg_CR_indomain))
 print("  Avg Test Reward (In-Domain)  = {:>7.2f}".format(avg_Rew_ID))
 print("  Avg Test Reward (OOD)        = {:>7.2f}".format(avg_Rew_OD))
 print("  Average Test Rewards (all)   = {:>7.2f}".format(avg_Rew_all))
@@ -822,9 +876,13 @@ for _mode_name in ['in_domain', 'ood']:
             writer.add_scalar(f'FinalTest/{_mode_name}_ep{_i}_{_k}',
                               float(_v), _final_step)
 
-writer.add_scalar('FinalTest/Average_SR',       avg_SR,      _final_step)
+# [Table I 数据源变更] Average_SR / Average_CR 现在写训练 SR/CR (滑动 100 ep 平均).
+# 原 in-domain 评估值改写到 InDomain_SR_aux / InDomain_CR_aux 辅助标签, 不丢数据.
+writer.add_scalar('FinalTest/Average_SR',       avg_SR,      _final_step)   # train sliding mean
+writer.add_scalar('FinalTest/Average_CR',       avg_CR,      _final_step)   # train sliding mean
+writer.add_scalar('FinalTest/InDomain_SR_aux',  avg_SR_indomain, _final_step)  # in-domain test ref
+writer.add_scalar('FinalTest/InDomain_CR_aux',  avg_CR_indomain, _final_step)
 writer.add_scalar('FinalTest/Average_APLR',     avg_APLR,    _final_step)
-writer.add_scalar('FinalTest/Average_CR',       avg_CR,      _final_step)
 writer.add_scalar('FinalTest/Average_MinClr',   avg_MinClr,  _final_step)
 writer.add_scalar('FinalTest/Average_SR_OOD',   avg_SR_OOD,  _final_step)
 writer.add_scalar('FinalTest/Average_CR_OOD',   avg_CR_OOD,  _final_step)
@@ -845,12 +903,17 @@ except Exception as _e:
     print(f"  [warn] writer.add_text failed: {_e}")
 
 # 持久化
+# [Table I 数据源变更] avg_SR / avg_CR 现在是 train 滑动 100 ep 的平均 (Table I 主行用值).
+# avg_SR_indomain / avg_CR_indomain 是原 in-domain 评估值 (辅助参考, 消融分析可读取).
 metrics['final_eval'] = {
     'in_domain':              _final_eval_results['in_domain'],
     'ood':                    _final_eval_results['ood'],
-    'avg_SR':                 avg_SR,
+    'avg_SR':                 avg_SR,             # train sliding-100 mean
+    'avg_CR':                 avg_CR,             # train sliding-100 mean
+    'avg_SR_indomain':        avg_SR_indomain,    # [aux] in-domain test SR
+    'avg_CR_indomain':        avg_CR_indomain,    # [aux] in-domain test CR
+    'train_metric_window':    TRAIN_METRIC_WINDOW,
     'avg_APLR':               avg_APLR,
-    'avg_CR':                 avg_CR,
     'avg_MinClr':             avg_MinClr,
     'occ_iou':                None,   # N/A
     'ade':                    None,   # N/A

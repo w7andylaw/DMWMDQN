@@ -274,6 +274,81 @@ def trk_loss_multi_peak(pred_occ, gt_occ, n_peaks, patch_size=5):
     return F.smooth_l1_loss(pred_coords, gt_coords, reduction='none')
 
 
+def symlog(x: torch.Tensor) -> torch.Tensor:
+    """
+    [DreamerV3 标准] Symmetric log transform:
+        symlog(x) = sign(x) · log(1 + |x|)
+
+    用于 reward head 训练目标的尺度压缩. 解决的问题:
+        环境奖励跨 ~3 个数量级 (step penalty -0.01, goal +20, collision -10).
+        在原始尺度下, reward_model 的 MSE 损失被大奖励主导, -0.01 的梯度
+        占比 ~(0.01)² / (10)² ≈ 10⁻⁶, 网络对它完全不敏感 —— reward_model
+        预测倾向于稳定在 0 附近, 丢失了"每步都有小惩罚"这一关键信号.
+
+    symlog 后:
+        -0.01 → -0.00995       (几乎不压缩)
+         0.00 →  0
+        10.00 → +2.40
+        20.00 → +3.04
+        -10.0 → -2.40
+
+    大奖励被压到 ~O(1) 量级, 小奖励保持 ~O(0.01), 梯度比变成 10⁻⁴, 更平衡.
+
+    数值稳定性: 用 log1p 避免 log(1+x) 在小 x 时精度损失.
+    """
+    return torch.sign(x) * torch.log1p(torch.abs(x))
+
+
+def symexp(x: torch.Tensor) -> torch.Tensor:
+    """
+    [DreamerV3 标准] symlog 的逆变换:
+        symexp(y) = sign(y) · (exp(|y|) - 1)
+
+    使用时机: reward_model 的裸输出 tilde_r_t ∈ symlog 空间, 在 imagination
+    中消费前先 symexp 回原始尺度, 以便:
+        * 风险项 λ_risk · χ 保持原来的权重语义
+        * TD target γ·ĉ·Q 的折扣尺度不变
+        * Q 网络仍然输出"累积真实奖励"而不需学习 symlog 逆变换
+
+    数值稳定性: 用 expm1 避免 exp(x)-1 在小 x 时精度损失.
+    """
+    return torch.sign(x) * torch.expm1(torch.abs(x))
+
+
+def compute_boundary_target(grid_size: int, margin: float = 2.0,
+                             device=None, dtype=torch.float32) -> torch.Tensor:
+    """
+    [工程化扩展] 预计算静态边界风险 GT:
+
+        d(gx, gy)    = min(gx, gy, Ng-1-gx, Ng-1-gy)        # 到最近边的格距
+        B_gt(gx, gy) = max(0, 1 - d / margin)
+
+    物理直觉:
+        * 贴边 (d=0)       → B=1.0  —— 最高风险
+        * 向内 1 格 (d=1)  → B=0.5  —— margin=2 时
+        * 内部 (d ≥ margin)→ B=0.0  —— 安全
+
+    该张量是**时不变常量**, 每训练步复用, 不参与梯度流 (detach 语义).
+
+    Args:
+        grid_size: Ng, 地图网格边长 (e.g. 30).
+        margin:    风险衰减宽度 (格数), 2.0 通常合理.
+        device:    目标设备.
+        dtype:     目标精度.
+    Returns:
+        B_gt: (Ng, Ng) float tensor ∈ [0, 1], 不需梯度.
+    """
+    g = torch.arange(grid_size, dtype=dtype, device=device)
+    gx = g.view(-1, 1).expand(grid_size, grid_size)
+    gy = g.view(1, -1).expand(grid_size, grid_size)
+    d = torch.minimum(
+        torch.minimum(gx, grid_size - 1 - gx),
+        torch.minimum(gy, grid_size - 1 - gy),
+    )
+    bdry = (1.0 - d / max(margin, 1e-6)).clamp(min=0.0, max=1.0)
+    return bdry.detach()
+
+
 def lineplot(x, y, name, path, xaxis='Episodes'):
     import matplotlib
     matplotlib.use('Agg')

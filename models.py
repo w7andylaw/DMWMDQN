@@ -345,6 +345,87 @@ class ObstacleForecaster(nn.Module):
 
 
 # ============================================================================
+#  [工程化扩展 — 非论文项] BoundaryForecaster: D_b
+# ----------------------------------------------------------------------------
+#  动机:
+#      论文 (26) 的 -λ_out·I[p_{t+1} ∉ A] 是反应式惩罚 —— UAV 真的飞出
+#      边界后才扣分. 在 latent imagination 里, actor 没有任何梯度信号
+#      能提前告知"朝角落/边缘方向前进有风险", 导致靠近边界的想象轨迹
+#      只能依赖 collision/boundary 的稀疏终止 reward 学习.
+#
+#      本模块与 ObstacleForecaster (公式 24) 架构对称, 但有两处关键简化:
+#        (a) 输出单通道静态图 B̂ ∈ [0,1]^{Ng×Ng} —— 边界不随时间变化,
+#            无 K 步展开也无 flow.
+#        (b) 在 risk 注入时对同一张 B̂ 沿想象轨迹索引 K 个位置:
+#                χ_bdry_t = max_{1≤k≤K} B̂(ĩ_{t+k})
+#            与 obstacle χ_t 完全同构.
+#
+#  该模块不是论文公式, 属于工程扩展 —— 等价于给 actor 一个可微、
+#  前瞻性的"靠近边界风险"正则项.
+# ============================================================================
+
+class BoundaryForecaster(nn.Module):
+    """
+    [工程化扩展] 静态边界占用预测:
+        B̂ = D_b(h_t, z_t, m_t),  B̂ ∈ [0, 1]^{Ng×Ng}
+
+    与 ObstacleForecaster 的三处差异:
+        * 输出单通道 (不是 K 通道) —— 边界是时不变的静态风险场.
+        * 无 flow 头 —— 边界不流动.
+        * GT 由环境几何确定 (距边界距离的软衰减), 调用方提供常量张量.
+
+    风险注入 (由 main 训练循环负责):
+        χ_bdry_t = max_{1≤k≤K} B̂(ĩ_{t+k})
+        imged_reward -= λ_risk_bdry · χ_bdry
+    """
+
+    def __init__(self, belief_size=200, state_size=30, map_embedding_size=256,
+                 grid_size=30):
+        super().__init__()
+        self.grid_size = grid_size
+
+        input_size = belief_size + state_size + map_embedding_size
+
+        # 隐状态 → 空间特征 (与 ObstacleForecaster 同一 trunk 拓扑)
+        self.fc = nn.Sequential(
+            nn.Linear(input_size, 1024),
+            nn.ELU(),
+            nn.Linear(1024, 128 * 4 * 4),
+            nn.ELU(),
+        )
+        self.deconv1 = nn.ConvTranspose2d(128, 64, 4, stride=2, padding=1)  # 4→8
+        self.deconv2 = nn.ConvTranspose2d(64, 32, 4, stride=2, padding=1)   # 8→16
+        self.conv_adapt = nn.Conv2d(32, 32, 3, stride=1, padding=1)
+
+        # 单通道头: B̂ ∈ [0,1]^{Ng×Ng}
+        self.bdry_head = nn.Conv2d(32, 1, 3, stride=1, padding=1)
+
+        self.component_modules = [
+            self.fc, self.deconv1, self.deconv2, self.conv_adapt, self.bdry_head,
+        ]
+
+    def forward(self, belief, state, map_embedding):
+        """
+        Args:
+            belief:        (B, belief_size)
+            state:         (B, state_size)
+            map_embedding: (B, map_embedding_size)
+        Returns:
+            bdry_pred: (B, Ng, Ng) —— 静态边界风险图 ∈ [0, 1]
+        """
+        B = belief.size(0)
+        h = self.fc(torch.cat([belief, state, map_embedding], dim=1))
+        h = h.view(B, 128, 4, 4)
+        h = F.elu(self.deconv1(h))                              # (B, 64, 8, 8)
+        h = F.elu(self.deconv2(h))                              # (B, 32, 16, 16)
+        h = F.interpolate(h, size=(self.grid_size, self.grid_size),
+                          mode='bilinear', align_corners=False)
+        h = F.elu(self.conv_adapt(h))                           # (B, 32, Ng, Ng)
+        bdry = torch.sigmoid(self.bdry_head(h)).squeeze(1)      # (B, Ng, Ng)
+        return bdry
+
+
+# ============================================================================
 #  [公式 22, 38] ContinuationModel: D_c
 # ============================================================================
 

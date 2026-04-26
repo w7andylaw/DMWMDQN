@@ -51,7 +51,12 @@ from models import (
     # [D3QN 替换] QNetwork + QPolicy 已并入 models.py, 替换原 ActorModel / ValueModel
     QNetwork, QPolicy, sync_target,
 )
-from utils import FreezeParameters, imagine_ahead, lambda_return, lineplot, write_video, trk_loss_multi_peak
+from utils import (
+    FreezeParameters, imagine_ahead, lambda_return, lineplot, write_video,
+    trk_loss_multi_peak,
+    # [DreamerV3 风格] reward head symlog 变换
+    symlog, symexp,
+)
 
 
 # ============================================================================
@@ -150,7 +155,18 @@ parser.add_argument('--lambda-occ', type=float, default=5.0, help='Weight for oc
 parser.add_argument('--lambda-flow', type=float, default=2.0, help='Weight for motion flow loss (公式42)')
 parser.add_argument('--lambda-trk', type=float, default=1.0, help='Weight for trajectory loss (公式43)')
 parser.add_argument('--lambda-upd', type=float, default=5.0, help='[C-2] Weight for map updater loss (公式11, 独立于 L_map)')
-parser.add_argument('--lambda-risk-imag', type=float, default=0.005, help='[C-1] Risk penalty weight in imagination')
+parser.add_argument('--lambda-risk-imag', type=float, default=0.01, help='[C-1] Risk penalty weight in imagination')
+# ─── [DreamerV3 风格] reward head symlog 变换 ───────────────────────
+# 默认开启 —— 解决 reward 跨量级 (-0.01 step penalty vs ±10/20 terminal)
+# 导致 reward_model 对小信号不敏感的问题. 消融对照请用 --no-reward-symlog.
+parser.add_argument('--reward-symlog', dest='reward_symlog',
+                    action='store_true', default=True,
+                    help='[DreamerV3] symlog-transform reward targets for training, '
+                         'symexp reward_model output in imagination. 默认开启.')
+parser.add_argument('--no-reward-symlog', dest='reward_symlog',
+                    action='store_false',
+                    help='关闭 symlog, reward_model 在原始尺度训练 (论文原始设置).')
+# ─────────────────────────────────────────────────────────────────
 parser.add_argument('--forecast-horizon', type=int, default=5, help='Obstacle forecasting K steps')
 parser.add_argument('--num-obstacles', type=int, default=3,
                     help='[公式 25/43] 环境中障碍物数量 K_peaks, 用于多峰 tracking loss. '
@@ -219,7 +235,21 @@ metrics = {
     'continuation_loss': [], 'map_loss': [], 'occ_loss': [], 'flow_loss': [],
     # [D3QN 替换] actor_loss + value_loss → q_loss
     'q_loss': [],
+    # ─── [训练 SR/CR] 训练阶段成功率 / 碰撞率 ──────────────────────────
+    # train_success / train_collision: 每 episode 二值标签 (0/1),
+    #   口径与评估完全一致 — 严格读取 env._last_info, 不再做 reward 阈值反推.
+    # train_sr / train_cr: 最近 TRAIN_METRIC_WINDOW (=100) 个 episodes 的
+    #   滑动平均 (%), 用于平滑训练曲线、与评估指标对齐.
+    'train_success': [],
+    'train_collision': [],
+    'train_sr': [],
+    'train_cr': [],
 }
+
+# [训练 SR/CR] 滑动窗口大小 (episodes). 100 是常用经验值: 既能压住
+# DRL 训练的高方差, 又不会过度滞后 — 评估时也是 args.test_episodes ≈ 10
+# 的小样本, 滑动 100 等于把 ~10 个评估周期的成功事件平均到一起.
+TRAIN_METRIC_WINDOW = 100
 
 summary_name = results_dir + "/{}_{}_log"
 writer = SummaryWriter(summary_name.format(args.env, args.id))
@@ -253,14 +283,26 @@ elif not args.test:
     )
     for s in range(1, args.seed_episodes + 1):
         observation, done, t = env.reset(), False, 0
+        # [训练 SR/CR] 与正式训练 rollout 同口径: 累积 reach/collision 标志.
+        _seed_reached = False
+        _seed_collided = False
+        _seed_inner = env._env if hasattr(env, '_env') else env
         while not done:
             action = env.sample_random_action()
             next_observation, reward, done = env.step(action)
             D.append(observation, action, reward, done)
             observation = next_observation
             t += 1
+            _info = getattr(_seed_inner, '_last_info', {}) or {}
+            if _info.get('reach', False):
+                _seed_reached = True
+            if _info.get('collision', False):
+                _seed_collided = True
         metrics['steps'].append(t * args.action_repeat + (0 if len(metrics['steps']) == 0 else metrics['steps'][-1]))
         metrics['episodes'].append(s)
+        # [训练 SR/CR] 二值事件; 不在此处算滑动平均, 留给主训练循环统一处理.
+        metrics['train_success'].append(1 if _seed_reached else 0)
+        metrics['train_collision'].append(1 if _seed_collided else 0)
 print("Experience replay buffer is ready.")
 
 #  Model Initialization
@@ -420,7 +462,13 @@ if args.models != '' and os.path.exists(args.models):
         target_q_net.load_state_dict(model_dicts['target_q_net'])
     else:
         target_q_net.load_state_dict(q_net.state_dict())
-    model_optimizer.load_state_dict(model_dicts['model_optimizer'])
+    # BoundaryForecaster 已移除后, 旧 checkpoint 的 model_optimizer 参数组数量可能不匹配。
+    # 模型权重仍可加载；optimizer 状态不兼容时跳过并重新初始化 optimizer。
+    if 'model_optimizer' in model_dicts:
+        try:
+            model_optimizer.load_state_dict(model_dicts['model_optimizer'])
+        except ValueError as _e:
+            print(f"[WARN] Skip loading model_optimizer due to architecture change: {_e}")
     if 'q_optimizer' in model_dicts:
         q_optimizer.load_state_dict(model_dicts['q_optimizer'])
     if 'q_update_count' in model_dicts:
@@ -724,7 +772,7 @@ for episode in tqdm(
             print(f"  [WARN] NaN detected in TransitionModel output at step {s}, skipping this batch.")
             # 回退: 清零梯度, 跳过此 batch
             model_optimizer.zero_grad()
-            losses.append([0.0] * 10)
+            losses.append([0.0] * 9)
             torch.cuda.empty_cache()
             continue
 
@@ -796,6 +844,11 @@ for episode in tqdm(
         torch.cuda.empty_cache()
 
         # --- [公式 37] L_r: 奖励回归损失 ---
+        # [DreamerV3 风格] 若 args.reward_symlog=True, 则 target 在 symlog 空间:
+        #   reward_model 的裸输出 == symlog(r_true) 的估计
+        #   使用时 (imagination) 再 symexp 回原始尺度.
+        # 这不改变论文公式 (37) 的语义 —— 只是把网络的 regression target
+        # 从 r 换成 symlog(r), MSE 损失结构保持不变.
         with autocast(enabled=use_amp):
             if flat_map_emb_loss is not None:
                 reward_pred = reward_model(flat_beliefs, flat_post_states, flat_map_emb_loss)
@@ -804,7 +857,11 @@ for episode in tqdm(
                 _flat_b = beliefs.view(T_loss * B_loss, -1)
                 _flat_s = posterior_states.view(T_loss * B_loss, -1)
                 reward_pred = reward_model(_flat_b, _flat_s).view(T_loss, B_loss)
-        reward_loss = F.mse_loss(reward_pred.float(), rewards[:-1], reduction='mean')
+        _reward_target = rewards[:-1]
+        if args.reward_symlog:
+            _reward_target = symlog(_reward_target)
+        reward_loss = F.mse_loss(reward_pred.float(), _reward_target, reduction='mean')
+        del _reward_target
 
         # --- [公式 38] L_c: Continuation 损失 (BCE) ---
         with autocast(enabled=use_amp):
@@ -1017,7 +1074,8 @@ for episode in tqdm(
         if 'forecast_mask' in dir() and forecast_mask is not None:
             del forecast_mask
 
-        # --- [公式 35] 总损失 L_WM (严格对应论文 8+1 项) ---
+        # --- [公式 35] 总损失 L_WM ---
+        # 保留论文 world-model 损失项；BoundaryForecaster 已移除。
         # [C-2 修复] map_updater_loss 使用独立权重 lambda_upd, 不与 L_map 混合
         model_loss = (
             args.lambda_img * observation_loss       # 公式(36) L_img
@@ -1139,7 +1197,11 @@ for episode in tqdm(
             #  2) 想象中的 r̂_t, ĉ_t, 风险项 χ_t (全部来自 frozen WM)
             # ---------------------------------------------------------------
             with FreezeParameters(model_modules):
-                imged_reward = reward_model(flat_ib, flat_ips, flat_ime).view(H, N)
+                # [DreamerV3 风格] 若 reward_symlog=True, reward_model 输出 ∈ symlog 空间,
+                # 需 symexp 回原始尺度以保持 λ_risk / TD target / Q 的语义一致性.
+                _raw_r_pred = reward_model(flat_ib, flat_ips, flat_ime).view(H, N)
+                imged_reward = symexp(_raw_r_pred) if args.reward_symlog else _raw_r_pred
+                del _raw_r_pred
                 imged_cont = continuation_model(flat_ib, flat_ips, flat_ime).view(H, N)
 
                 # [公式 28 修复] risk-sensitive imagination 沿轨迹采样
@@ -1161,12 +1223,14 @@ for episode in tqdm(
                 #   - _dir8[i] = (Δgx, Δgy),  new_pos = pos + dir*cell_size
                 #   - gx = pos[0]/cell_size,  Mocc[gx, gy] 即 [first_spatial, second_spatial]
                 #   所以 occ_pred 的 first spatial = gx, second = gy. 与 action_dirs 对齐.
-                if args.lambda_risk_imag > 0:
-                    # occ_pred: (H*N, K, Ng, Ng) → (H, N, K, Ng, Ng)
-                    occ_pred, _ = obstacle_forecaster(flat_ib, flat_ips, flat_ime)
-                    K_f = occ_pred.size(1)
-                    Ng  = occ_pred.size(-1)                 # 30
-                    occ_pred = occ_pred.view(H, N, K_f, Ng, Ng)
+                #
+                # [公式 28] obstacle risk: 仅保留动态障碍物风险，边界风险由 safety_mask 处理。
+                _use_obs_risk  = args.lambda_risk_imag > 0
+
+                if _use_obs_risk:
+                    # ── 共享: 想象轨迹的网格坐标 pos_hk ──────────────────────
+                    K_f = args.forecast_horizon
+                    Ng  = 30
 
                     # 8 方向 (Δgx, Δgy), 与 env._dir8 逐项一致.
                     _dir8_t = torch.tensor([
@@ -1181,7 +1245,6 @@ for episode in tqdm(
                     cum_disp = torch.cumsum(action_dirs, dim=0)
 
                     # 起点网格坐标 (N, 2) — 来自 obs_pos[1:] 对应 s_0.
-                    # reshape 顺序: t 先, b 后 — 与 imge_* 的 flatten 约定一致.
                     _cell_size = 100.0                       # = D/Ng = 3000/30, env 默认
                     start_grid = (obs_pos[1:].reshape(-1, 2).to(_dev).float()
                                   / _cell_size)              # (N, 2) float
@@ -1191,31 +1254,31 @@ for episode in tqdm(
                     k_idx = torch.arange(K_f, device=_dev).view(1, K_f)
                     cum_i = (t_idx + k_idx + 1).clamp(max=H - 1)   # (H, K)
 
-                    # 用 cum_i 索引 cum_disp, 得到 (H, K, N, 2) 的位移张量
-                    # cum_disp: (H, N, 2) → 按 dim=0 取 index
-                    disp_hk = cum_disp[cum_i]                       # (H, K, N, 2)
-
-                    # 想象位置 (浮点), 广播 start_grid: (1, 1, N, 2)
-                    pos_hk = start_grid.view(1, 1, N, 2) + disp_hk   # (H, K, N, 2)
-                    pos_hk = pos_hk.clamp(0, Ng - 1).round().long()  # 取整, clip
+                    disp_hk = cum_disp[cum_i]                        # (H, K, N, 2)
+                    pos_hk  = start_grid.view(1, 1, N, 2) + disp_hk  # (H, K, N, 2)
+                    pos_hk  = pos_hk.clamp(0, Ng - 1).round().long()
 
                     ix_first  = pos_hk[..., 0]                       # (H, K, N) — gx
                     ix_second = pos_hk[..., 1]                       # (H, K, N) — gy
-
-                    # 用 advanced indexing 从 occ_pred[H, N, K, Ng, Ng] 取值
-                    # 目标: occ_at_pos[t, k, n] = occ_pred[t, n, k, gx, gy]
-                    # 先把 occ_pred permute 到 (H, K, N, Ng, Ng) 方便 H,K,N 维对齐
-                    occ_perm = occ_pred.permute(0, 2, 1, 3, 4)       # (H, K, N, Ng, Ng)
                     h_ar = torch.arange(H,   device=_dev).view(H, 1, 1).expand(H, K_f, N)
-                    k_ar = torch.arange(K_f, device=_dev).view(1, K_f, 1).expand(H, K_f, N)
                     n_ar = torch.arange(N,   device=_dev).view(1, 1, N).expand(H, K_f, N)
+
+                # ── [公式 28] χ_obstacle = max_k Ô_{t+k}(ĩ_{t+k}) ───────────
+                if _use_obs_risk:
+                    # occ_pred: (H*N, K, Ng, Ng) → (H, N, K, Ng, Ng) → (H, K, N, Ng, Ng)
+                    occ_pred, _ = obstacle_forecaster(flat_ib, flat_ips, flat_ime)
+                    occ_pred = occ_pred.view(H, N, K_f, Ng, Ng)
+                    occ_perm = occ_pred.permute(0, 2, 1, 3, 4)       # (H, K, N, Ng, Ng)
+                    k_ar = torch.arange(K_f, device=_dev).view(1, K_f, 1).expand(H, K_f, N)
                     occ_at_pos = occ_perm[h_ar, k_ar, n_ar, ix_first, ix_second]  # (H, K, N)
-
-                    chi = occ_at_pos.max(dim=1).values               # (H, N) — max over K
+                    chi = occ_at_pos.max(dim=1).values               # (H, N)
                     imged_reward = imged_reward - args.lambda_risk_imag * chi
+                    del occ_pred, occ_perm, occ_at_pos, chi, k_ar
 
-                    del occ_pred, occ_perm, action_dirs, cum_disp, disp_hk, pos_hk
-                    del ix_first, ix_second, occ_at_pos, chi, h_ar, k_ar, n_ar
+                # 清理共享轨迹张量
+                if _use_obs_risk:
+                    del action_dirs, cum_disp, disp_hk, pos_hk
+                    del ix_first, ix_second, h_ar, n_ar
 
             # ---------------------------------------------------------------
             #  3) Double DQN TD 目标
@@ -1389,16 +1452,10 @@ for episode in tqdm(
                                 if d < min_clearance:
                                     min_clearance = d
 
-                        # 到达/碰撞: 优先从 env.info dict 读取, 回退到 reward 阈值
-                        _info = getattr(_inner_env, '_last_info', {})
-                        if not _info:
-                            # Env wrapper 可能不暴露 info, 用 reward 阈值判断
-                            _reach_thresh = getattr(_inner_env, 'reward_reach', 100.0)
-                            if r_val >= _reach_thresh * 0.9:
-                                _info = {'reach': True}
-                            _col_thresh = getattr(_inner_env, 'reward_collision', -10.0)
-                            if r_val <= _col_thresh * 0.9:
-                                _info['collision'] = True
+                        # 到达/碰撞: 严格读取 env._last_info, 不再做 reward 阈值反推.
+                        # reward_collision == reward_boundary == -10, fallback 会把出界
+                        # 误记为 collision, 与新的 CR 口径冲突.
+                        _info = getattr(_inner_env, '_last_info', {}) or {}
 
                         if _info.get('reach', False):
                             reached = True
@@ -1427,7 +1484,11 @@ for episode in tqdm(
             # 汇总指标 (论文 Table I)
             sr = ep_successes / max(ep_total, 1) * 100
             cr = ep_collisions / max(ep_total, 1) * 100
-            aplr = float(np.mean(ep_path_ratios)) if ep_path_ratios else 0.0
+            # [APLR NaN 修复] 没人到达时 ep_path_ratios 为空 — APLR 在此 batch 上
+            # "无定义", 不应记 0. 0 会被 lineplot 当成有效数据点画出"训练初期 APLR
+            # 跌到 0"的误导性曲线. NaN 让 matplotlib 自动断线, 也让下游 _mean_ignore_nan
+            # 跨周期聚合时正确忽略.
+            aplr = float(np.mean(ep_path_ratios)) if ep_path_ratios else float('nan')
             min_clr = float(np.mean(ep_min_clearances)) if ep_min_clearances else 0.0
             avg_reward = float(np.mean(ep_rewards)) if ep_rewards else 0.0
 
@@ -1610,6 +1671,13 @@ for episode in tqdm(
         prev_map = None  # [M3]
         action = torch.zeros(1, env.action_size, device=args.device)
 
+        # [训练 SR/CR] episode 级累积标志 — 与评估循环 (1432-1437 行) 同口径,
+        # 严格读 env._last_info['reach'/'collision'], 不再用 reward 阈值反推
+        # (reward_collision == reward_boundary == -10, 阈值法会把出界并入 CR).
+        _train_reached = False
+        _train_collided = False
+        _train_inner = env._env if hasattr(env, '_env') else env
+
         pbar = tqdm(range(args.max_episode_length // args.action_repeat))
         for t in pbar:
             (belief, posterior_state, map_emb, prev_map,
@@ -1624,6 +1692,15 @@ for episode in tqdm(
             D.append(observation, action.cpu(), reward, done)
             total_reward += reward
             observation = next_observation
+
+            # [训练 SR/CR] 每步检查事件标志 — 一旦置 True 就保持, 因为单 episode 内
+            # reach 与 collision 都是终止性事件 (env.step 一旦置位即 done).
+            _info = getattr(_train_inner, '_last_info', {}) or {}
+            if _info.get('reach', False):
+                _train_reached = True
+            if _info.get('collision', False):
+                _train_collided = True
+
             if args.render:
                 env.render()
             if done:
@@ -1633,10 +1710,35 @@ for episode in tqdm(
         metrics['steps'].append(t + metrics['steps'][-1])
         metrics['episodes'].append(episode)
         metrics['train_rewards'].append(total_reward)
+
+        # ─── [训练 SR/CR] 写入 metrics + 滑动平均 + TensorBoard + 绘图 ───
+        metrics['train_success'].append(1 if _train_reached else 0)
+        metrics['train_collision'].append(1 if _train_collided else 0)
+
+        # 滑动窗口: 取最近 TRAIN_METRIC_WINDOW 个 episodes 平均.
+        # 训练初期不足窗口长度时, 直接用全部已有 episodes (从 seed_episodes 起).
+        _win = min(TRAIN_METRIC_WINDOW, len(metrics['train_success']))
+        _train_sr = float(np.mean(metrics['train_success'][-_win:])) * 100.0
+        _train_cr = float(np.mean(metrics['train_collision'][-_win:])) * 100.0
+        metrics['train_sr'].append(_train_sr)
+        metrics['train_cr'].append(_train_cr)
+
+        # TensorBoard: 同时写"瞬时事件 (0/1)"和"滑动平均 (%)" — 前者用于
+        # 调试单 episode 行为, 后者用于看趋势.
+        writer.add_scalar('Train/Success', metrics['train_success'][-1], episode)
+        writer.add_scalar('Train/Collision', metrics['train_collision'][-1], episode)
+        writer.add_scalar('Train/SR',  _train_sr, episode)
+        writer.add_scalar('Train/CR',  _train_cr, episode)
+
         lineplot(
             metrics['episodes'][-len(metrics['train_rewards']):],
             metrics['train_rewards'], 'Train Rewards', results_dir,
         )
+        # 训练 SR/CR 曲线: x 轴用 train_sr 自身长度 (= seed_episodes + 已训练 ep 数),
+        # 与 train_rewards 同步.
+        _sr_x = metrics['episodes'][-len(metrics['train_sr']):]
+        lineplot(_sr_x, metrics['train_sr'], 'Train SR', results_dir)
+        lineplot(_sr_x, metrics['train_cr'], 'Train CR', results_dir)
 
     # ===============================================================
     #  Checkpoint
@@ -1825,14 +1927,8 @@ for _eval_mode, _mode_tasks in _eval_tasks_dict.items():
                         if _d < min_clearance:
                             min_clearance = _d
 
+                # [同上] 严格读 _last_info, 无 reward fallback.
                 _info = getattr(_inner_env, '_last_info', {}) or {}
-                if not _info:
-                    _rt = getattr(_inner_env, 'reward_reach', 100.0)
-                    _rc = getattr(_inner_env, 'reward_collision', -10.0)
-                    if r_val >= _rt * 0.9:
-                        _info = {'reach': True}
-                    if r_val <= _rc * 0.9:
-                        _info['collision'] = True
                 if _info.get('reach', False):
                     reached = True
                 if _info.get('collision', False):
@@ -1905,14 +2001,29 @@ for _i, _rec in enumerate(_final_eval_results['ood'], 1):
 # ── 4. 汇总: 论文 Table I 的一行 ─────────────────────────────────────────────
 def _mean_ignore_nan(vals):
     vs = [v for v in vals if v is not None and not (isinstance(v, float) and np.isnan(v))]
-    return float(np.mean(vs)) if vs else 0.0
+    # [APLR NaN 修复] 全空 → NaN, 不再返回 0.
+    # 全空意味着 "整组评测都没产生这个指标的有效样本" (例如 in-domain 全失败 → APLR 全 NaN),
+    # 此时返回 0 会让论文 Table I 出现 "APLR=0.000" 这种比"完美最短路"还离谱的数,
+    # 直接误导读者. NaN 在 print 里显示为 "nan", 在 TensorBoard scalar 里被自动跳过.
+    return float(np.mean(vs)) if vs else float('nan')
 
 _id_recs = _final_eval_results['in_domain']
 _od_recs = _final_eval_results['ood']
 
-avg_SR      = _mean_ignore_nan([r['SR']     for r in _id_recs])
+# ─── [Table I 数据源变更] SR (%)↑ / CR (%)↓ 改用训练 SR/CR (滑动 100 ep 平均) ───
+# 理由:
+#   * in-domain test 仅 args.test_episodes ≈ 10 个 ep, 单次评估方差极大;
+#   * metrics['train_sr'][-1] 是训练循环最后一次写入的滑动 100 ep 均值 — 更稳定,
+#     且直接反映"模型在训练分布上的最终能力", 对应 Table I 的 SR (%)↑ 语义.
+#   * SR-OOD / CR-OOD 仍来自 OOD 评估 (held-out 地图, 必须独立跑).
+# 原 in-domain 评估值保留为 avg_SR_indomain / avg_CR_indomain, 写入 metrics['final_eval']
+# 与 TensorBoard 辅助标签, 不丢数据, 仅不进 Table I 主行.
+avg_SR_indomain = _mean_ignore_nan([r['SR'] for r in _id_recs])
+avg_CR_indomain = _mean_ignore_nan([r['CR'] for r in _id_recs])
+avg_SR = metrics['train_sr'][-1] if metrics['train_sr'] else float('nan')
+avg_CR = metrics['train_cr'][-1] if metrics['train_cr'] else float('nan')
+
 avg_APLR    = _mean_ignore_nan([r['APLR']   for r in _id_recs])
-avg_CR      = _mean_ignore_nan([r['CR']     for r in _id_recs])
 avg_MinClr  = _mean_ignore_nan([r['MinClr'] for r in _id_recs])
 avg_SR_OOD  = _mean_ignore_nan([r['SR']     for r in _od_recs])
 avg_CR_OOD  = _mean_ignore_nan([r['CR']     for r in _od_recs])
@@ -1923,9 +2034,9 @@ avg_Rew_all = _mean_ignore_nan([r['Reward'] for r in _id_recs + _od_recs])
 print("\n" + "=" * 92)
 print(" Paper Table I — Averaged over all test episodes")
 print("=" * 92)
-print("  SR (%)↑          = {:>7.2f}".format(avg_SR))
+print("  SR (%)↑          = {:>7.2f}    [train, sliding-{} ep]".format(avg_SR, TRAIN_METRIC_WINDOW))
 print("  APLR↓            = {:>7.3f}".format(avg_APLR))
-print("  CR (%)↓          = {:>7.2f}".format(avg_CR))
+print("  CR (%)↓          = {:>7.2f}    [train, sliding-{} ep]".format(avg_CR, TRAIN_METRIC_WINDOW))
 print("  MinClr↑          = {:>7.2f}".format(avg_MinClr))
 print("  Occ-IoU↑         = {:>7.3f}".format(final_occ_iou))
 print("  ADE↓             = {:>7.2f}".format(final_ade))
@@ -1933,6 +2044,8 @@ print("  FDE↓             = {:>7.2f}".format(final_fde))
 print("  SR-OOD (%)↑      = {:>7.2f}".format(avg_SR_OOD))
 print("  CR-OOD (%)↓      = {:>7.2f}".format(avg_CR_OOD))
 print("  --------------------------------")
+print("  [aux] In-Domain Eval SR  = {:>7.2f}".format(avg_SR_indomain))
+print("  [aux] In-Domain Eval CR  = {:>7.2f}".format(avg_CR_indomain))
 print("  Avg Test Reward (In-Domain)  = {:>7.2f}".format(avg_Rew_ID))
 print("  Avg Test Reward (OOD)        = {:>7.2f}".format(avg_Rew_OD))
 print("  Average Test Rewards (all)   = {:>7.2f}".format(avg_Rew_all))
@@ -1950,9 +2063,14 @@ for _mode_name in ['in_domain', 'ood']:
             writer.add_scalar(f'FinalTest/{_mode_name}_ep{_i}_{_k}', float(_v), _final_step)
 
 # 5b. 按论文 Table I 列写入平均值 (全部标在同一个 step 上, 方便对照)
-writer.add_scalar('FinalTest/Average_SR',       avg_SR,      _final_step)
+# [Table I 数据源变更] Average_SR / Average_CR 现在写训练 SR/CR (滑动 100 ep 平均).
+# 原 in-domain 评估的 SR/CR 值改写到 FinalTest/InDomain_SR_aux / InDomain_CR_aux
+# 辅助标签, 不丢数据.
+writer.add_scalar('FinalTest/Average_SR',       avg_SR,      _final_step)   # train sliding mean
+writer.add_scalar('FinalTest/Average_CR',       avg_CR,      _final_step)   # train sliding mean
+writer.add_scalar('FinalTest/InDomain_SR_aux',  avg_SR_indomain, _final_step)  # in-domain test ref
+writer.add_scalar('FinalTest/InDomain_CR_aux',  avg_CR_indomain, _final_step)
 writer.add_scalar('FinalTest/Average_APLR',     avg_APLR,    _final_step)
-writer.add_scalar('FinalTest/Average_CR',       avg_CR,      _final_step)
 writer.add_scalar('FinalTest/Average_MinClr',   avg_MinClr,  _final_step)
 writer.add_scalar('FinalTest/Average_Occ_IoU',  final_occ_iou, _final_step)
 writer.add_scalar('FinalTest/Average_ADE',      final_ade,   _final_step)
@@ -1979,12 +2097,17 @@ except Exception as _e:
     print(f"  [warn] writer.add_text failed: {_e}")
 
 # 5e. 持久化到 metrics.pth
+# [Table I 数据源变更] avg_SR / avg_CR 现在是 train 滑动 100 ep 的平均 (Table I 主行用值).
+# avg_SR_indomain / avg_CR_indomain 是原 in-domain 评估值 (辅助参考, 消融分析可读取).
 metrics['final_eval'] = {
     'in_domain':              _final_eval_results['in_domain'],
     'ood':                    _final_eval_results['ood'],
-    'avg_SR':                 avg_SR,
+    'avg_SR':                 avg_SR,             # train sliding-100 mean
+    'avg_CR':                 avg_CR,             # train sliding-100 mean
+    'avg_SR_indomain':        avg_SR_indomain,    # [aux] in-domain test SR (mean over test_episodes)
+    'avg_CR_indomain':        avg_CR_indomain,    # [aux] in-domain test CR
+    'train_metric_window':    TRAIN_METRIC_WINDOW,
     'avg_APLR':               avg_APLR,
-    'avg_CR':                 avg_CR,
     'avg_MinClr':             avg_MinClr,
     'occ_iou':                final_occ_iou,
     'ade':                    final_ade,

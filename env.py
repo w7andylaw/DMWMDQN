@@ -320,17 +320,17 @@ class UAVNavigationEnv(gym.Env):
         fixed_position_seed=12345,
         speed_scale=1.0,
         # --- [论文公式 26 扩展] 奖励参数 ---
-        reward_reach=20.0,            # rg — 到达目标区域
+        reward_reach=30.0,            # rg — 到达目标区域
         reward_boundary=-10.0,        # λ_out — 出界惩罚
         reward_step_penalty=-0.01,    # λ_step — 每步时间代价
         reward_collision=-10.0,       # λ_col — 碰撞惩罚
-        reward_rel_scale=0.5,         # λ_rel — 检测置信度增益 (Δs_t)
-        reward_risk_scale=0.01,       # λ_risk — 预测风险惩罚
+        reward_rel_scale=1.0,         # λ_rel — 检测置信度增益 (Δs_t)
+        reward_risk_scale=0.03,       # λ_risk — 预测风险惩罚
         # --- 新增密集奖励项 (正则化, 解决稀疏奖励) ---
-        reward_explore_scale=0.1,     # 新覆盖区域奖励
-        reward_revisit_penalty=-0.05, # 重复访问惩罚
-        reward_position_scale=0.05,   # 位置进展奖励 (靠近高 M^rel 区域)
-        reach_radius=3,               # 到达判定半径 (切比雪夫距离, 格)
+        reward_explore_scale=0.02,     # 新覆盖区域奖励
+        reward_revisit_penalty=-0.02, # 重复访问惩罚
+        reward_position_scale=0.1,   # 位置进展奖励 (靠近高 M^rel 区域)
+        reach_radius=5,               # 到达判定半径 (切比雪夫距离, 格)
         # --- 可选 shaping ---
         similarity_reward_scale=0.0,
         # --- Siamese 相似度参数 ---
@@ -349,7 +349,7 @@ class UAVNavigationEnv(gym.Env):
         # 碰撞判定距离 = obstacle_rho + uav_rho
         # 原始值 120+60=180px=1.8格, 碰撞直径3.6格 → 250步存活率≈0%
         # 调整后 40+20=60px=0.6格, 碰撞直径1.2格 → 250步存活率≈20%
-        num_obstacles=3,
+        num_obstacles=2,
         obstacle_speed=20.0,       # 慢速更易预测和规避
         obstacle_rho=40.0,         # 障碍物安全半径
         uav_rho=20.0,              # UAV 安全半径
@@ -977,13 +977,13 @@ class UAVNavigationEnv(gym.Env):
 
     def _compute_safety_mask(self, pos):
         """
-        计算 8 方向安全掩码 σ_t ∈ [0,1]^8.
-        σ_t[i] = 1 表示方向 i 安全, 0 表示危险(障碍物/出界/不可通行).
+        计算 8 方向安全掩码 σ_t ∈ {0,1}^8.
+        σ_t[i] = 1 表示方向 i 不出界, 0 表示出界.
 
-        融合三种信息:
-          - 边界: 下一步是否出界
-          - M^trv: 目标格是否曾碰撞 (CH_TRV == -1)
-          - M^occ: 目标格的动态占用概率
+        说明:
+          - 仅做边界检查, 不再考虑 M^trv / M^occ.
+          - 障碍物规避完全交给 reward signal + 语义地图观测自学习.
+          - Agent 远离边缘时该 mask 退化为全 1, 编码层会逐渐忽略该分支.
         """
         mask = np.ones(8, dtype=np.float32)
         for i, d in enumerate(self._dir8):
@@ -991,17 +991,6 @@ class UAVNavigationEnv(gym.Env):
             # 出界检查
             if not (0 <= next_pos[0] <= self.D and 0 <= next_pos[1] <= self.D):
                 mask[i] = 0.0
-                continue
-            ngx, ngy = self._pos_to_grid(next_pos)
-            ngx = int(np.clip(ngx, 0, self.Ng - 1))
-            ngy = int(np.clip(ngy, 0, self.Ng - 1))
-            # 不可通行 (之前碰撞过)
-            if self.semantic_map[self.CH_TRV, ngx, ngy] < 0:
-                mask[i] = 0.0
-                continue
-            # 动态占用: 1 - occ (高占用 → 低安全)
-            occ = float(self.semantic_map[self.CH_OCC, ngx, ngy])
-            mask[i] = max(0.0, 1.0 - occ)
         return mask
 
     def _get_obs(self):
@@ -1134,13 +1123,11 @@ class UAVNavigationEnv(gym.Env):
             terminated = True
             new_pos = np.clip(new_pos, 0, self.D)
             info['boundary'] = True
-            # [CR 语义统一] 出界也算"碰撞"(不安全终止).
-            # 所有下游评估器都读 _last_info['collision'] 来累计 CR —
-            # 在唯一真源 (env.step) 处把出界并进去, 就避免每个 main 里
-            # 都得记得去 or 一下 info['boundary']. 'boundary' 键保留,
-            # 如果后面要做"障碍物碰撞率 vs 出界率"的细分统计, 仍可区分:
-            #   obs_coll_only = info['collision'] and not info.get('boundary')
-            info['collision'] = True
+            # [CR 语义变更] 出界不再并入 'collision'.
+            # info['collision'] 现在严格只表示"撞动态障碍物" (公式 4),
+            # 来源唯一: 下方 _check_collision(new_pos) == True 的分支.
+            # 下游若要"任何不安全终止率", 自行 or:
+            #   unsafe = info.get('collision') or info.get('boundary')
         else:
             new_gx, new_gy = self._pos_to_grid(new_pos)
             target_gx, target_gy = self._pos_to_grid(self.target_pos)
