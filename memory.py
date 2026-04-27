@@ -31,8 +31,7 @@ class ExperienceReplay:
                 'target': np.empty((size, 3, 64, 64), dtype=np.uint8),
                 'position': np.empty((size, 2), dtype=np.float32),
                 'semantic_map': np.empty((size, *sem_map_shape), dtype=np.float16),
-                # 安全掩码: 8 方向安全度 ∈ [0,1], 融合边界/Mtrv/Mocc 信息
-                'safety_mask': np.empty((size, 8), dtype=np.float32),
+                # [shield 改造] safety_mask 已移除 — 边界由 hard shield 保证
             }
 
         elif symbolic_env:
@@ -60,11 +59,7 @@ class ExperienceReplay:
             self.observations['target'][self.idx] = postprocess_observation(obs_np['target'], self.bit_depth)
             self.observations['position'][self.idx] = obs_np['position']
             self.observations['semantic_map'][self.idx] = obs_np['semantic_map']
-            # 安全掩码
-            if 'safety_mask' in obs_np:
-                self.observations['safety_mask'][self.idx] = obs_np['safety_mask']
-            else:
-                self.observations['safety_mask'][self.idx] = np.ones(8, dtype=np.float32)
+            # [shield 改造] safety_mask 已移除
 
         elif self.symbolic_env:
             self.observations[self.idx] = observation.numpy()
@@ -118,9 +113,7 @@ class ExperienceReplay:
             pos_data = self.observations['position'][vec_idxs]
             obs_batch['position'] = torch.as_tensor(pos_data).reshape(L, n, -1)
 
-            # safety_mask: 8 维安全掩码
-            sm_data = self.observations['safety_mask'][vec_idxs]
-            obs_batch['safety_mask'] = torch.as_tensor(sm_data).reshape(L, n, -1)
+            # [shield 改造] safety_mask 已移除
 
             # semantic_map: 存储为 float16, 取出时转 float32
             sem_map_data = self.observations['semantic_map'][vec_idxs]

@@ -94,8 +94,8 @@ parser.add_argument(
     help='Environment',
 )
 parser.add_argument('--symbolic-env', action='store_true', help='Symbolic features')
-parser.add_argument('--max-episode-length', type=int, default=100, metavar='T')
-parser.add_argument('--experience-size', type=int, default=1000000, metavar='D',
+parser.add_argument('--max-episode-length', type=int, default=500, metavar='T')
+parser.add_argument('--experience-size', type=int, default=500000, metavar='D',
                     help='Experience replay size')
 parser.add_argument('--cnn-activation-function', type=str, default='relu', choices=dir(F))
 parser.add_argument('--dense-activation-function', type=str, default='elu', choices=dir(F))
@@ -168,14 +168,14 @@ parser.add_argument('--no-reward-symlog', dest='reward_symlog',
                     help='关闭 symlog, reward_model 在原始尺度训练 (论文原始设置).')
 # ─────────────────────────────────────────────────────────────────
 parser.add_argument('--forecast-horizon', type=int, default=5, help='Obstacle forecasting K steps')
-parser.add_argument('--num-obstacles', type=int, default=3,
+parser.add_argument('--num-obstacles', type=int, default=1,
                     help='[公式 25/43] 环境中障碍物数量 K_peaks, 用于多峰 tracking loss. '
-                         '必须与 env 的 num_obstacles 一致 (默认 3).')
+                         '必须与 env 的 num_obstacles 一致.')
 parser.add_argument('--trk-patch-size', type=int, default=5,
                     help='[公式 43] 软质心 patch 大小, 奇数. 建议 3~7.')
 parser.add_argument('--encode-batch', type=int, default=100, metavar='EB',
                     help='Mini-batch size for encoder forward')
-parser.add_argument('--eval-steps', type=int, default=1000, metavar='ES')
+parser.add_argument('--eval-steps', type=int, default=500, metavar='ES')
 
 # ============================================================================
 #  [D3QN 替换] D3QN 专属超参数
@@ -558,16 +558,10 @@ def update_belief_and_act(
             pos = pos.unsqueeze(0)
         obs_vec = pos
 
-        # 安全掩码
-        if 'safety_mask' in observation:
-            obs_safety = observation['safety_mask'].to(args.device)
-            if obs_safety.dim() == 1:
-                obs_safety = obs_safety.unsqueeze(0)
-        else:
-            obs_safety = None
+        # [shield 改造] safety_mask 已移除 — 边界由 hard shield 物理保证
 
-        # Encoder: e_t = E_φ(I_t, I^g, p_t, σ_t)
-        full_output = encoder(obs_img, obs_tgt_img, obs_vec, safety_mask=obs_safety)
+        # Encoder: e_t = E_φ(I_t, I^g, p_t)
+        full_output = encoder(obs_img, obs_tgt_img, obs_vec)
         embed = full_output[0] if isinstance(full_output, tuple) else full_output
 
         # MapEncoder: m_t = E_m(M_t) — 新的地图嵌入
@@ -663,8 +657,7 @@ for episode in tqdm(
             obs_pos = observations['position']           # CPU
             obs_vec = obs_pos
             obs_sem_map = observations['semantic_map']   # CPU
-            # 安全掩码: (L, B, 8) CPU
-            obs_safety = observations.get('safety_mask', None)
+            # [shield 改造] safety_mask 已移除
 
             T, B = obs_img.shape[:2]
             TB = T * B
@@ -674,7 +667,6 @@ for episode in tqdm(
             flat_tgt_cpu = obs_tgt_img.reshape(TB, *obs_tgt_img.shape[2:])
             flat_vec_cpu = obs_vec.reshape(TB, -1)
             flat_sem_map_cpu = obs_sem_map.reshape(TB, *obs_sem_map.shape[2:])
-            flat_safety_cpu = obs_safety.reshape(TB, -1) if obs_safety is not None else None
 
             # === Encoder (mini-batch) ===
             embed_chunks = []
@@ -683,14 +675,13 @@ for episode in tqdm(
                 _img = flat_img_cpu[i:j].contiguous().float().to(_dev)
                 _tgt = flat_tgt_cpu[i:j].contiguous().float().to(_dev)
                 _vec = flat_vec_cpu[i:j].contiguous().float().to(_dev)
-                _safety = flat_safety_cpu[i:j].contiguous().float().to(_dev) if flat_safety_cpu is not None else None
                 with autocast(enabled=use_amp):
-                    out = encoder(_img, _tgt, _vec, safety_mask=_safety)
+                    out = encoder(_img, _tgt, _vec)
                 if isinstance(out, tuple):
                     embed_chunks.append(out[0])
                 else:
                     embed_chunks.append(out)
-                del _img, _tgt, _vec, _safety, out
+                del _img, _tgt, _vec, out
             torch.cuda.empty_cache()
 
             flat_embed = torch.cat(embed_chunks, dim=0)
@@ -1224,7 +1215,7 @@ for episode in tqdm(
                 #   - gx = pos[0]/cell_size,  Mocc[gx, gy] 即 [first_spatial, second_spatial]
                 #   所以 occ_pred 的 first spatial = gx, second = gy. 与 action_dirs 对齐.
                 #
-                # [公式 28] obstacle risk: 仅保留动态障碍物风险，边界风险由 safety_mask 处理。
+                # [公式 28] obstacle risk: 仅保留动态障碍物风险, 边界由 hard shield 物理保证, 不需 reward 项.
                 _use_obs_risk  = args.lambda_risk_imag > 0
 
                 if _use_obs_risk:
@@ -1452,9 +1443,10 @@ for episode in tqdm(
                                 if d < min_clearance:
                                     min_clearance = d
 
-                        # 到达/碰撞: 严格读取 env._last_info, 不再做 reward 阈值反推.
-                        # reward_collision == reward_boundary == -10, fallback 会把出界
-                        # 误记为 collision, 与新的 CR 口径冲突.
+                        # 到达/碰撞: 严格读取 env._last_info.
+                        # [shield 改造] 不再有 boundary 终止事件 — agent 物理上不会出界,
+                        # info['blocked']=True 仅表示该步动作被 shield 拦截 (原地不动), 不是终止.
+                        # SR/CR 仅看 reach 和 collision (动态障碍物碰撞).
                         _info = getattr(_inner_env, '_last_info', {}) or {}
 
                         if _info.get('reach', False):
@@ -1568,8 +1560,8 @@ for episode in tqdm(
                     _flat_img = _img.view(_TB, *_img.shape[2:])
                     _flat_tgt = _tgt.view(_TB, *_tgt.shape[2:])
                     _flat_pos = _pos.view(_TB, -1)
-                    _flat_safety = _obs['safety_mask'].float().to(_dev_e).view(_TB, -1) if 'safety_mask' in _obs else None
-                    _enc_out = encoder(_flat_img, _flat_tgt, _flat_pos, safety_mask=_flat_safety)
+                    # [shield 改造] safety_mask 已移除
+                    _enc_out = encoder(_flat_img, _flat_tgt, _flat_pos)
                     _flat_emb = _enc_out[0] if isinstance(_enc_out, tuple) else _enc_out
                     _full_emb = _flat_emb.view(_T, _B, -1)
                     _embed = _full_emb[1:]  # (T-1, B, emb_size)
@@ -1671,9 +1663,9 @@ for episode in tqdm(
         prev_map = None  # [M3]
         action = torch.zeros(1, env.action_size, device=args.device)
 
-        # [训练 SR/CR] episode 级累积标志 — 与评估循环 (1432-1437 行) 同口径,
-        # 严格读 env._last_info['reach'/'collision'], 不再用 reward 阈值反推
-        # (reward_collision == reward_boundary == -10, 阈值法会把出界并入 CR).
+        # [训练 SR/CR] episode 级累积标志 — 与评估循环同口径,
+        # 严格读 env._last_info['reach'/'collision'].
+        # [shield 改造] 不再有 boundary 终止事件, 仅 reach 和 collision 终止 episode.
         _train_reached = False
         _train_collided = False
         _train_inner = env._env if hasattr(env, '_env') else env
@@ -1816,14 +1808,12 @@ with torch.no_grad():
         _img_f = _obs_f['image'].float().to(_dev_f)
         _tgt_f = _obs_f['target'].float().to(_dev_f)
         _pos_f = _obs_f['position'].float().to(_dev_f)
-        _saf_f = (_obs_f['safety_mask'].float().to(_dev_f).view(_TB_f, -1)
-                  if 'safety_mask' in _obs_f else None)
+        # [shield 改造] safety_mask 已移除
 
         _enc_f = encoder(
             _img_f.view(_TB_f, *_img_f.shape[2:]),
             _tgt_f.view(_TB_f, *_tgt_f.shape[2:]),
             _pos_f.view(_TB_f, -1),
-            safety_mask=_saf_f,
         )
         _flat_emb_f = _enc_f[0] if isinstance(_enc_f, tuple) else _enc_f
         _embed_f = _flat_emb_f.view(_T_f, _B_f, -1)[1:]

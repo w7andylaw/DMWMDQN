@@ -486,15 +486,14 @@ class UAVHybridEncoder(nn.Module):
         # Position stream
         self.fc_vec = nn.Linear(2, 64)
 
-        # Safety mask stream: 8 → 32
-        self.fc_safety = nn.Linear(8, 32)
+        # [shield 改造] fc_safety 已移除 — 边界由 hard shield 物理保证, 不需软警告
 
-        # Fusion: curr(1024) + targ(1024) + pos(64) + safety(32)
-        self.fc_out = nn.Linear(1024 + 1024 + 64 + 32, embedding_size)
+        # Fusion: curr(1024) + targ(1024) + pos(64)
+        self.fc_out = nn.Linear(1024 + 1024 + 64, embedding_size)
 
         self.component_modules = [
             self.conv1, self.conv2, self.conv3, self.conv4,
-            self.fc_vec, self.fc_safety, self.fc_out
+            self.fc_vec, self.fc_out
         ]
     def forward_visual(self, img):
         hidden = self.act_fn(self.conv1(img))
@@ -503,15 +502,11 @@ class UAVHybridEncoder(nn.Module):
         hidden = self.act_fn(self.conv4(hidden))
         return hidden.view(hidden.size(0), 1024)
     def forward(self, image, target_image, vector, safety_mask=None):
+        # 注: safety_mask 参数保留是为了向后兼容旧 checkpoint 加载, 但已被忽略 (shield 改造).
         curr_emb = self.forward_visual(image)
         targ_emb = self.forward_visual(target_image)
         vec_emb = self.act_fn(self.fc_vec(vector))
-        # 安全掩码: 推理/想象阶段可能无 safety_mask, 默认全安全
-        if safety_mask is None:
-            safety_emb = torch.zeros(image.size(0), 32, device=image.device)
-        else:
-            safety_emb = self.act_fn(self.fc_safety(safety_mask))
-        combined = torch.cat([curr_emb, targ_emb, vec_emb, safety_emb], dim=1)
+        combined = torch.cat([curr_emb, targ_emb, vec_emb], dim=1)
         out = self.fc_out(combined)
         return out, curr_emb, targ_emb
 

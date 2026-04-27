@@ -5,7 +5,7 @@ d3qn.py — Dueling Double DQN Baseline for UAV Navigation
 
 与 WM 完全一致的部分:
   1. 环境 (UAVEnvWrapper, UAV-v0)
-  2. 字典观测接口 (image / target / position / semantic_map / safety_mask)
+  2. 字典观测接口 (image / target / position / semantic_map)  [shield 改造: 移除 safety_mask]
   3. 训练-评测-采样循环结构 (seed → train → eval → collect → ckpt)
   4. metrics 字典键名, lineplot/TensorBoard 写入格式
   5. 评测指标口径: SR / CR / APLR / MinClr / Reward (in-domain + OOD)
@@ -44,7 +44,7 @@ parser.add_argument('--disable-cuda', action='store_true')
 parser.add_argument('--env', type=str, default='UAV-v0',
                     choices=GYM_ENVS + CONTROL_SUITE_ENVS + ['UAV-v0'])
 parser.add_argument('--symbolic-env', action='store_true')
-parser.add_argument('--max-episode-length', type=int, default=100)
+parser.add_argument('--max-episode-length', type=int, default=500)
 parser.add_argument('--experience-size', type=int, default=500000,
                     help='Replay buffer size')
 parser.add_argument('--action-repeat', type=int, default=1)
@@ -147,14 +147,13 @@ class D3QNReplayBuffer:
 
         sem_shape = obs_space['semantic_map'].shape   # (6, 30, 30)
         pos_shape = obs_space['position'].shape       # (2,)
-        sm_shape = obs_space['safety_mask'].shape     # (8,)
+        # [shield 改造] safety_mask 已移除
 
         self.obs = {
             'image':        np.empty((size, 3, 64, 64), dtype=np.uint8),
             'target':       np.empty((size, 3, 64, 64), dtype=np.uint8),
             'position':     np.empty((size, *pos_shape), dtype=np.float32),
             'semantic_map': np.empty((size, *sem_shape), dtype=np.float16),
-            'safety_mask':  np.empty((size, *sm_shape), dtype=np.float32),
         }
         # 下一观测 — 同样结构
         self.next_obs = {
@@ -162,7 +161,6 @@ class D3QNReplayBuffer:
             'target':       np.empty((size, 3, 64, 64), dtype=np.uint8),
             'position':     np.empty((size, *pos_shape), dtype=np.float32),
             'semantic_map': np.empty((size, *sem_shape), dtype=np.float16),
-            'safety_mask':  np.empty((size, *sm_shape), dtype=np.float32),
         }
         self.actions = np.empty((size,), dtype=np.int64)
         self.rewards = np.empty((size,), dtype=np.float32)
@@ -191,13 +189,12 @@ class D3QNReplayBuffer:
         self.obs['target'][self.idx]     = postprocess_observation(o['target'], self.bit_depth)
         self.obs['position'][self.idx]   = o['position']
         self.obs['semantic_map'][self.idx] = o['semantic_map']
-        self.obs['safety_mask'][self.idx]  = o['safety_mask']
 
         self.next_obs['image'][self.idx]      = postprocess_observation(no['image'],  self.bit_depth)
         self.next_obs['target'][self.idx]     = postprocess_observation(no['target'], self.bit_depth)
         self.next_obs['position'][self.idx]   = no['position']
         self.next_obs['semantic_map'][self.idx] = no['semantic_map']
-        self.next_obs['safety_mask'][self.idx]  = no['safety_mask']
+        # [shield 改造] safety_mask 已移除
 
         # action: int index
         if torch.is_tensor(action):
@@ -228,7 +225,7 @@ class D3QNReplayBuffer:
             batch[key] = t
         batch['position']     = torch.as_tensor(d['position'][idxs])
         batch['semantic_map'] = torch.as_tensor(d['semantic_map'][idxs].astype(np.float32))
-        batch['safety_mask']  = torch.as_tensor(d['safety_mask'][idxs])
+        # [shield 改造] safety_mask 已移除
         return batch
 
     def sample(self, batch_size):
@@ -252,7 +249,7 @@ class DuelingQNet(nn.Module):
         - image (3,64,64)        → CNN → 512
         - target (3,64,64)       → CNN → 512
         - semantic_map (6,30,30) → CNN → 512
-        - [position(2) ‖ safety_mask(8)]  → MLP → 64
+        - [position(2) → 6 维边界特征]    → MLP → 64
     Dueling 头: Q = V(s) + (A(s,·) − mean_a A(s,·))
     """
     def __init__(self, action_size, hidden=256):
@@ -279,10 +276,13 @@ class DuelingQNet(nn.Module):
             nn.Linear(128 * 4 * 4, 256), nn.ReLU(),
         )
 
-        # 向量特征 (position + safety_mask)
+        # 向量特征 (position 边界特征)
+        # [shield 改造] safety_mask 已移除 — 边界由 hard shield 物理保证
+        # [位置编码扩展] position 从 raw (2,) 展开为 6 维边界特征 (见 forward).
+        # 维度: 6 (position 边界特征)
         self.vec_mlp = nn.Sequential(
-            nn.Linear(2 + 8, 64), nn.ReLU(),
-            nn.Linear(64, 64),    nn.ReLU(),
+            nn.Linear(6, 64), nn.ReLU(),
+            nn.Linear(64, 64), nn.ReLU(),
         )
 
         feat_dim = 256 + 256 + 256 + 64  # = 832
@@ -307,12 +307,27 @@ class DuelingQNet(nn.Module):
         map_f = self.map_cnn(obs['semantic_map'])
 
         pos = obs['position']
-        sm  = obs['safety_mask']
-        # squeeze 可能的多余维度 (B, 1, 2) → (B, 2) etc.
+        # squeeze 可能的多余维度 (B, 1, 2) → (B, 2)
         if pos.dim() == 3: pos = pos.squeeze(1)
-        if sm.dim() == 3:  sm  = sm.squeeze(1)
-        vec = torch.cat([pos, sm], dim=-1)
-        vec_f = self.vec_mlp(vec)
+
+        # ─── [位置坐标特征工程] 显式边界特征 ─────────────────────────────
+        # pos ∈ [0, 1]² (env wrapper 已 normalize: position / D)
+        # 6 维特征:
+        #   [0:2]  原始坐标 x, y                      — 绝对位置信息
+        #   [2:4]  到最近 x/y 墙的距离 ∈ [0, 0.5]    — 越小越靠墙
+        #   [4:6]  危险度抛物面 (1-2·d)² ∈ [0, 1]    — 双峰: 中心 0, 墙边 1
+        # 注: shield 改造后 agent 物理上不会出界, 但"靠墙"仍是有意义的状态特征 —
+        #     agent 在墙边时可选动作集合变小 (hard shield 拦截了出界方向),
+        #     Q-net 需要识别这些状态以学到合适的 V(s).
+        x = pos[:, 0:1]
+        y = pos[:, 1:2]
+        dist_x = torch.minimum(x, 1.0 - x)
+        dist_y = torch.minimum(y, 1.0 - y)
+        danger_x = (1.0 - 2.0 * dist_x).pow(2)
+        danger_y = (1.0 - 2.0 * dist_y).pow(2)
+        pos_feat = torch.cat([pos, dist_x, dist_y, danger_x, danger_y], dim=-1)  # (B, 6)
+
+        vec_f = self.vec_mlp(pos_feat)
 
         h = torch.cat([img_f, tgt_f, map_f, vec_f], dim=-1)
         h = self.fusion(h)
@@ -493,9 +508,10 @@ def run_episode(env, agent, epsilon, train=False):
                 if d < min_clearance:
                     min_clearance = d
 
-        # 到达/碰撞判定: 严格读取 env._last_info, 不再做 reward 阈值反推.
-        # 原因: reward_collision == reward_boundary == -10, 单看 reward
-        # 无法区分撞障碍物与出界, fallback 会把出界误记为 collision.
+        # 到达/碰撞判定: 严格读取 env._last_info.
+        # [shield 改造] 不再有 boundary 终止事件 — agent 物理上不会出界,
+        # info['blocked']=True 仅表示该步动作被 shield 拦截 (原地不动), 不是终止.
+        # SR/CR 仅看 reach 和 collision.
         # _last_info 缺失时 (异常 wrapper / mock env) 该 step 不计入任何指标.
         _info = getattr(_inner, '_last_info', {}) or {}
         if _info.get('reach', False):

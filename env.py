@@ -321,7 +321,13 @@ class UAVNavigationEnv(gym.Env):
         speed_scale=1.0,
         # --- [论文公式 26 扩展] 奖励参数 ---
         reward_reach=30.0,            # rg — 到达目标区域
-        reward_boundary=-10.0,        # λ_out — 出界惩罚
+        reward_blocked=-0.2,          # λ_blk — [论文公式 26 修订] 提议的非法动作被
+                                      # boundary safety shield 拦截时的轻惩罚.
+                                      # 物理上 agent 不出界 (公式 1 hard shield), 故无 λ_out.
+                                      # -0.2 ≈ 20× step_penalty, 比 step 强但 ≪ collision (-10):
+                                      #   * 让 agent 学到"非法动作有代价"
+                                      #   * 但不让"原地不动"成为比"试错"更糟的选择
+                                      #   * 探索期不会因 ε-greedy 撞墙意图被毁灭性惩罚
         reward_step_penalty=-0.01,    # λ_step — 每步时间代价
         reward_collision=-10.0,       # λ_col — 碰撞惩罚
         reward_rel_scale=1.0,         # λ_rel — 检测置信度增益 (Δs_t)
@@ -349,7 +355,7 @@ class UAVNavigationEnv(gym.Env):
         # 碰撞判定距离 = obstacle_rho + uav_rho
         # 原始值 120+60=180px=1.8格, 碰撞直径3.6格 → 250步存活率≈0%
         # 调整后 40+20=60px=0.6格, 碰撞直径1.2格 → 250步存活率≈20%
-        num_obstacles=1,
+        num_obstacles=2,
         obstacle_speed=20.0,       # 慢速更易预测和规避
         obstacle_rho=40.0,         # 障碍物安全半径
         uav_rho=20.0,              # UAV 安全半径
@@ -375,7 +381,7 @@ class UAVNavigationEnv(gym.Env):
         # ---------- 奖励参数 ----------
         self.speed_scale = speed_scale
         self.reward_reach = reward_reach
-        self.reward_boundary = reward_boundary
+        self.reward_blocked = float(reward_blocked)
         self.reward_step_penalty = reward_step_penalty
         self.reward_collision = float(reward_collision)
         self.reward_rel_scale = float(reward_rel_scale)
@@ -414,6 +420,8 @@ class UAVNavigationEnv(gym.Env):
         # ---------- 观测空间 ----------
         # [论文公式 5] y_t = {I_t, I^g, p_t} + 语义地图 M_t
         # [M-3 修复] target_position 已移除 — 论文公式(5)不含目标坐标
+        # [shield 改造] safety_mask 已移除 — 论文公式(1)用 hard boundary shield
+        # 替代了软警告信号, 所有 8 方向边界信息内化在 shield 物理拦截中.
         self.observation_space = spaces.Dict({
             'image': spaces.Box(low=0, high=255, shape=(3, 64, 64), dtype=np.uint8),
             'target': spaces.Box(low=0, high=255, shape=(3, 64, 64), dtype=np.uint8),
@@ -423,7 +431,6 @@ class UAVNavigationEnv(gym.Env):
                 shape=(self.N_MAP_CHANNELS, self.Ng, self.Ng),
                 dtype=np.float32
             ),
-            'safety_mask': spaces.Box(low=0.0, high=1.0, shape=(8,), dtype=np.float32),
         })
 
         # ---------- Siamese 网络 (论文方法, 必须加载) ----------
@@ -975,88 +982,9 @@ class UAVNavigationEnv(gym.Env):
         noisy = np.clip(image.astype(np.float32) + noise, 0, 255).astype(np.uint8)
         return noisy
 
-    def _compute_safety_mask(self, pos, margin_cells=2.5, release_radius=8.0):
-        """
-        计算 8 方向"距边界软安全度" σ_t ∈ [0, 1]^8.
-
-        定义:
-            σ_t[i] = clip(k_to_wall_along_dir_i / margin_cells, 0, 1)
-
-        其中 k_to_wall_along_dir_i 是沿方向 i 走到边界还需要的轴向格数
-        (浮点, 单位: cell), 取 x/y 两轴中先撞墙的那一轴的格数.
-
-        与原版 (二值出界检查) 对比:
-            * 原版: 下一步出界 → 0, 否则 1     (反应窗口 = 1 步, 离散信号)
-            * 新版: σ ∈ [0, 1] 连续衰减       (margin=2.5 → 提前 2-3 步预警)
-
-        margin_cells = 2.5 的取值理由:
-            * 太小 (<1.5) 信号衰减太快, 与原版差异不大
-            * 太大 (>4) 大部分时间 < 1, agent 学不到"哪里完全安全"
-            * 2.5 给 ε-greedy 探索充足反应窗口, 网格中心仍稳定 ≈ 1.0
-
-        ─── target 附近的 mask 自动解除 (release_radius) ──────────────
-        如果 target 本身就在边界附近, 边界警告会与 target 吸引信号冲突 —
-        encoder 学到"低 σ → 危险"的先验后, 即使 task reward 指示该贴近,
-        agent 也会回避, 导致"边界 target 找不到"的失败模式.
-
-        修复: 用切比雪夫距离判断到 target 的远近 (与 reach_radius 同口径),
-        距离 ≤ release_radius 时, mask 渐变向全 1 (无警告) 收敛:
-            fade = 1.0 - cheb / release_radius     (cheb=0 → fade=1, cheb=R → fade=0)
-            σ_t' = σ_t + (1 - σ_t) · fade
-
-        release_radius = 7.0 的取值理由:
-            * reach_radius = 5 (到达判定切比雪夫半径)
-            * margin_cells = 2.5 (mask 预警半径)
-            * release_radius = reach_radius + margin ≈ 7 — 在"开始要够 target"
-              的距离上就开始解除警告, 给 agent 完整的接近窗口
-            * 内圈 (cheb ≤ 5) 相当于已经在 reach 区附近, mask 几乎全 1
-            * 外圈 (cheb > 7) 完全保留边界警告
-
-        范围与语义:
-            * σ = 0     —— 已贴墙, 且远离 target — 强警告
-            * σ = 0.4   —— 距墙 1 格, 远离 target — 中等警告 (margin=2.5)
-            * σ = 1.0   —— 远离边界, 或正在接近 target — 完全放行
-
-        作用域:
-            * 仅描述边界, 不混入 M^trv / M^occ — 障碍物风险已由
-              forecast head + risk-aware reward (公式 28) 专门处理.
-            * 不进入 reward / 碰撞判定 / 动力学 — 仅作为 encoder 的额外输入,
-              因此向后兼容: 同种子下采样轨迹不变, 仅 encoder 输入分布改变.
-        """
-        mask = np.ones(8, dtype=np.float32)
-        for i, d in enumerate(self._dir8):
-            # 沿方向 d 到达边界还需要走多少格 (轴向格数)
-            # 解 0 ≤ pos[axis] + d[axis]*k*cell_size ≤ D, k > 0 取最小正解
-            ks = []
-            if d[0] > 0:
-                ks.append((self.D - pos[0]) / (d[0] * self.cell_size))
-            elif d[0] < 0:
-                ks.append(pos[0] / (-d[0] * self.cell_size))
-            if d[1] > 0:
-                ks.append((self.D - pos[1]) / (d[1] * self.cell_size))
-            elif d[1] < 0:
-                ks.append(pos[1] / (-d[1] * self.cell_size))
-            # 注意: d[axis] ∈ {-1, 0, +1}, 上述公式得到的 k 是"到墙的轴向格数".
-            # 对角方向 (|d|=√2) 时, x/y 两轴各自的 k 取 min — 谁先撞墙听谁的.
-            k_to_wall = min(ks) if ks else float('inf')   # 中心方向无墙时无穷
-            # 数值保护: 边界外 (clip 之前 k 可能为负) → clip 兜底为 0.
-            mask[i] = float(np.clip(k_to_wall / margin_cells, 0.0, 1.0))
-
-        # ─── target 附近 mask 渐变解除 ─────────────────────────────────
-        # 用切比雪夫距离 (与到达判定 reach_radius 同口径).
-        # 注意: 仅当 target_pos 已被设置时执行 (reset 之后才有效);
-        # 早期 reset 前的极少数调用如果没有 target_pos 属性, 跳过解除以兼容.
-        if hasattr(self, 'target_pos') and self.target_pos is not None:
-            dx = abs(pos[0] - self.target_pos[0]) / self.cell_size
-            dy = abs(pos[1] - self.target_pos[1]) / self.cell_size
-            cheb = max(dx, dy)
-            if cheb <= release_radius:
-                # fade ∈ [0, 1]: 距 target 越近 fade 越大, mask 被往 1 拉
-                fade = 1.0 - cheb / release_radius
-                # 凸组合: σ' = σ + (1-σ)·fade — fade=1 时 σ'=1 (完全解除)
-                mask = mask + (1.0 - mask) * fade
-                mask = np.clip(mask, 0.0, 1.0).astype(np.float32)
-        return mask
+    # [shield 改造] _compute_safety_mask 已删除 — 论文公式(1)的 hard boundary
+    # shield 已经物理上保证 agent 不出界, 软警告信号不再需要.
+    # 8 方向边界信息现在内化在 step() 的 A_B(p_t) 可行集合判定中.
 
     def _get_obs(self):
         img = self._get_current_view(self.agent_pos)
@@ -1066,7 +994,6 @@ class UAVNavigationEnv(gym.Env):
             'target': tgt,
             'position': self.agent_pos.copy(),
             'semantic_map': self.semantic_map.copy(),
-            'safety_mask': self._compute_safety_mask(self.agent_pos),
         }
 
     # ================================================================
@@ -1182,36 +1109,46 @@ class UAVNavigationEnv(gym.Env):
         # ===== 3. 每步时间代价 (所有情况都扣) =====
         reward += self.reward_step_penalty   # -0.01
 
-        # ===== 4. 边界检查 =====
-        if not (0 <= new_pos[0] <= self.D and 0 <= new_pos[1] <= self.D):
-            reward += self.reward_boundary   # -10
+        # ===== 4. 边界 safety shield (论文公式 1) =====
+        # A_B(p_t) = { a ∈ A_u | p_t + Δ·d(a) ∈ A }
+        # p̄_{t+1} = p_t + Δ·d(a_t)
+        # p_{t+1} = p̄_{t+1}    if p̄_{t+1} ∈ A     (shield 通过)
+        #         = p_t        otherwise            (shield 拦截 → 原地)
+        #
+        # 物理上 agent 不会出界, 故无 λ_out 终止性惩罚.
+        # 提议非法动作时给一个轻惩罚 λ_blk (-0.2), 训练 agent 不要重复尝试.
+        # 注: 这里的"shield 拦截"语义是 "agent 试图跨墙但被环境物理阻挡",
+        # 类似真实 UAV 撞到 geo-fence 后无法继续 — 不是 episode 结束.
+        proposed_out_of_bound = not (0 <= new_pos[0] <= self.D and
+                                      0 <= new_pos[1] <= self.D)
+        if proposed_out_of_bound:
+            # shield 拦截: agent 原地不动, 仅扣 λ_blk
+            new_pos = self.agent_pos.copy()
+            reward += self.reward_blocked
+            info['blocked'] = True
+            # 注意: 不 set terminated, 不 set 'boundary' — 这步没出界.
+            # 下面的 reach/collision/explore 检查仍要运行 (在原位置上).
+
+        # ===== 5-10. 在 (可能被 clamp 后的) new_pos 上跑后续判定 =====
+        new_gx, new_gy = self._pos_to_grid(new_pos)
+        target_gx, target_gy = self._pos_to_grid(self.target_pos)
+
+        # ===== 5. 到达检查 (区域判定, 切比雪夫距离 ≤ reach_radius) =====
+        cheb_to_target = max(abs(new_gx - target_gx), abs(new_gy - target_gy))
+        if cheb_to_target <= self.reach_radius:
+            reward += self.reward_reach   # +30
             terminated = True
-            new_pos = np.clip(new_pos, 0, self.D)
-            info['boundary'] = True
-            # [CR 语义变更] 出界不再并入 'collision'.
-            # info['collision'] 现在严格只表示"撞动态障碍物" (公式 4),
-            # 来源唯一: 下方 _check_collision(new_pos) == True 的分支.
-            # 下游若要"任何不安全终止率", 自行 or:
-            #   unsafe = info.get('collision') or info.get('boundary')
+            info['reach'] = True
         else:
-            new_gx, new_gy = self._pos_to_grid(new_pos)
-            target_gx, target_gy = self._pos_to_grid(self.target_pos)
-
-            # ===== 5. 到达检查 (区域判定, 切比雪夫距离 ≤ reach_radius) =====
-            cheb_to_target = max(abs(new_gx - target_gx), abs(new_gy - target_gy))
-            if cheb_to_target <= self.reach_radius:
-                reward += self.reward_reach   # +20
+            # ===== 6. 碰撞检查 (论文公式 4) =====
+            collision = self._check_collision(new_pos)
+            if collision:
+                reward += self.reward_collision   # -10
+                self.semantic_map[self.CH_TRV, new_gx, new_gy] = -1.0
                 terminated = True
-                info['reach'] = True
-            else:
-                # ===== 6. 碰撞检查 (论文公式 4) =====
-                collision = self._check_collision(new_pos)
-                if collision:
-                    reward += self.reward_collision   # -10
-                    self.semantic_map[self.CH_TRV, new_gx, new_gy] = -1.0
-                    terminated = True
-                    info['collision'] = True
+                info['collision'] = True
 
+        if not terminated:
             # ===== 7. 新覆盖区域奖励 + 重复访问惩罚 =====
             is_first_visit = bool(self.semantic_map[self.CH_EXP, new_gx, new_gy] == -1.0)
             if is_first_visit:
@@ -1319,8 +1256,7 @@ class UAVEnvWrapper:
         _D = self._env.D if hasattr(self._env, 'D') else 3000.0
         processed['position'] = torch.tensor(obs['position'] / _D, dtype=torch.float32).unsqueeze(0)
         processed['semantic_map'] = torch.tensor(obs['semantic_map'], dtype=torch.float32).unsqueeze(0)
-        # 安全掩码: 8 维, 值域 [0,1], 无需额外归一化
-        processed['safety_mask'] = torch.tensor(obs['safety_mask'], dtype=torch.float32).unsqueeze(0)
+        # [shield 改造] safety_mask 已移除 — 边界由 hard shield 物理保证
         return processed
 
     def sample_random_action(self):
