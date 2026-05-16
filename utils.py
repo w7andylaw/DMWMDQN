@@ -2,9 +2,8 @@
 utils.py — 修改对照:
 
 [1] imagine_ahead:
-    - [方案A 修复] 在想象中维护完整 6×30×30 语义地图
-    - 每步调用 MapTransitionModel.forward() 进行地图转移 (公式 19)
-    - 再通过 MapEncoder 编码为 map_embedding (公式 20)
+    - [严格论文时序] 先 RSSM transition (公式 17-18)，再 MapTransitionModel (公式 19)，最后 MapEncoder (公式 20)
+    - 在想象中维护完整 6×30×30 语义地图
     - 删除 _imagine_map_embedding 残差近似
 
 [2] lambda_return:
@@ -113,11 +112,14 @@ def imagine_ahead(
         current_state         = torch.nan_to_num(current_state,         nan=0.0, posinf=20.0, neginf=-20.0)
         current_map_embedding = torch.nan_to_num(current_map_embedding, nan=0.0, posinf=50.0, neginf=-50.0)
 
-        # [公式 29] 动作选择
+        # [公式 29] 动作选择：a_t ~ π/Q(h_t, z_t, m_t)
         _action = policy.get_action(current_belief, current_state, current_map_embedding)
         actions[t] = _action
 
-        # [公式 17-18] RSSM 一步预测 (M1: 不再传 semantic_state)
+        # [严格论文时序修复]
+        # 公式 (17)-(18): 先用当前地图嵌入 m_t 进入 RSSM，得到 h_{t+1}, z_{t+1}
+        #   h_{t+1} = f(h_t, z_t, a_t, m_t)
+        #   z_{t+1} ~ p(z_{t+1} | h_{t+1})
         output = transition_model(
             current_state,
             _action.unsqueeze(0),
@@ -127,17 +129,27 @@ def imagine_ahead(
             map_embeddings=current_map_embedding.unsqueeze(0),
         )
 
-        current_belief = output[0][0]
-        current_state = output[1][0]
+        next_belief = output[0][0]
+        next_state = output[1][0]
         _prior_mean = output[2][0]
         _prior_std_dev = output[3][0]
 
-        # [公式 19-20] 完整地图转移与编码
+        # 公式 (19)-(20): 再用 h_{t+1}, z_{t+1} 更新语义地图，并编码 m_{t+1}
+        #   M_{t+1} = T_omega(M_t, h_{t+1}, z_{t+1}, a_t)
+        #   m_{t+1} = E_m(M_{t+1})
         if has_full_map:
-            current_map = map_transition_model(
-                current_map, current_belief, current_state, _action, current_map_embedding
+            next_map = map_transition_model(
+                current_map, next_belief, next_state, _action, current_map_embedding
             )
-            current_map_embedding = map_encoder(current_map)
+            next_map_embedding = map_encoder(next_map)
+        else:
+            next_map = current_map
+            next_map_embedding = current_map_embedding
+
+        current_belief = next_belief
+        current_state = next_state
+        current_map = next_map
+        current_map_embedding = next_map_embedding
 
         beliefs[t] = current_belief
         prior_states[t] = current_state

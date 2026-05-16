@@ -168,7 +168,7 @@ parser.add_argument('--no-reward-symlog', dest='reward_symlog',
                     help='关闭 symlog, reward_model 在原始尺度训练 (论文原始设置).')
 # ─────────────────────────────────────────────────────────────────
 parser.add_argument('--forecast-horizon', type=int, default=5, help='Obstacle forecasting K steps')
-parser.add_argument('--num-obstacles', type=int, default=1,
+parser.add_argument('--num-obstacles', type=int, default=2,
                     help='[公式 25/43] 环境中障碍物数量 K_peaks, 用于多峰 tracking loss. '
                          '必须与 env 的 num_obstacles 一致.')
 parser.add_argument('--trk-patch-size', type=int, default=5,
@@ -262,9 +262,11 @@ if env is None:
 print("Environment is loaded.")
 
 # [公式 25/43] 用 env 实际的 num_obstacles 覆盖 args.num_obstacles, 消除两处手动同步.
-# UAVEnvWrapper 把 UAVNavigationEnv 包在 .env 里, 内层才有 num_obstacles 属性.
+# UAVEnvWrapper 把 UAVNavigationEnv 包在 _env 里, 内层才有 num_obstacles 属性.
 if args.env == 'UAV-v0':
-    _inner = getattr(env, 'env', None)
+    _inner = getattr(env, '_env', None)
+    if _inner is None:
+        _inner = getattr(env, 'env', None)
     _env_nobs = getattr(_inner, 'num_obstacles', None)
     if isinstance(_env_nobs, int):
         if _env_nobs != args.num_obstacles:
@@ -570,13 +572,11 @@ def update_belief_and_act(
             if obs_sem_map.dim() == 3:
                 obs_sem_map = obs_sem_map.unsqueeze(0)
 
-            if map_updater is not None and prev_map is not None:
-                refined_map, _ = map_updater(prev_map, embed.detach(), obs_vec)
-                new_map_embedding = map_encoder(refined_map)
-                current_map = refined_map.detach()
-            else:
-                new_map_embedding = map_encoder(obs_sem_map)
-                current_map = obs_sem_map.detach()
+            # [在线 rollout 修复] 真实环境已经返回 semantic_map，在线交互/评估时必须
+            # 直接用观测到的 M_t 编码，不能从第二步开始递归使用 map_updater 的生成图。
+            # map_updater 仍在世界模型训练中作为辅助可微更新器学习，但真实 rollout 以 env GT map 为准。
+            new_map_embedding = map_encoder(obs_sem_map)
+            current_map = obs_sem_map.detach()
         else:
             new_map_embedding = prev_map_embedding  # 无新地图, m_t = m_{t-1}
             current_map = prev_map
@@ -603,22 +603,19 @@ def update_belief_and_act(
         embed.unsqueeze(dim=0),
         map_embeddings=prev_map_embedding.unsqueeze(dim=0),       # m_{t-1} for GRU
         map_embeddings_post=new_map_embedding.unsqueeze(dim=0),   # m_t for posterior
+        deterministic=(not explore),                             # eval/test 关闭 latent sampling
     )
 
     belief = belief.squeeze(dim=0)
     posterior_state = posterior_state.squeeze(dim=0)
 
-    # Actor: π_η(a_t | h_t, z_t, m_t) — 用新的 m_t
-    action = planner.get_action(belief, posterior_state, new_map_embedding, det=not explore)
-
-    if explore:
-        B = action.shape[0]
-        action_size = action.shape[-1]
-        rand_mask = (torch.rand(B, device=action.device) < args.action_noise)
-        if rand_mask.any():
-            rand_idx = torch.randint(0, action_size, (B,), device=action.device)
-            rand_onehot = F.one_hot(rand_idx, num_classes=action_size).float()
-            action = torch.where(rand_mask.unsqueeze(-1), rand_onehot, action)
+    # Actor/QPolicy: π(a_t | h_t, z_t, m_t) — 用新的 m_t
+    # [ε-greedy 修复] 只在 QPolicy 内做一次 ε-greedy；不要再手动叠加第二次随机动作。
+    action = planner.get_action(
+        belief, posterior_state, new_map_embedding,
+        det=not explore,
+        epsilon=(args.action_noise if explore else 0.0),
+    )
 
     next_observation, reward, done = env.step(
         action.cpu() if isinstance(env, EnvBatcher) else action[0].cpu()
@@ -1235,10 +1232,10 @@ for episode in tqdm(
                     # 累积位移 cum_disp[i] = p_{i+1} - p_0,  shape (H, N, 2)
                     cum_disp = torch.cumsum(action_dirs, dim=0)
 
-                    # 起点网格坐标 (N, 2) — 来自 obs_pos[1:] 对应 s_0.
-                    _cell_size = 100.0                       # = D/Ng = 3000/30, env 默认
+                    # 起点网格坐标 (N, 2) — Env._process_obs 已把 position 归一化到 [0,1]。
+                    # 原来再除以 cell_size=100 会把 [0,1] 压到 [0,0.01]，风险采样几乎固定在左上角。
                     start_grid = (obs_pos[1:].reshape(-1, 2).to(_dev).float()
-                                  / _cell_size)              # (N, 2) float
+                                  * float(Ng))               # normalized pos → grid coord
 
                     # 构造所有 (t, k') 的 cum_disp 索引, clamp 至 H-1
                     t_idx = torch.arange(H, device=_dev).view(H, 1)
@@ -1277,33 +1274,43 @@ for episode in tqdm(
             #      a*  = argmax_a Q_online(s_{t+1}, a)
             #  对 t = 0..H-2 共 H-1 个 TD 目标
             # ---------------------------------------------------------------
-            next_b = imged_beliefs[1:].reshape(-1, imged_beliefs.shape[-1])
-            next_s = imged_prior_states[1:].reshape(-1, imged_prior_states.shape[-1])
-            next_m = imged_map_emb[1:].reshape(-1, imged_map_emb.shape[-1])
+            # [state-action 对齐修复]
+            # imagine_ahead 的 action[t] 是在进入 RSSM 前、由当前 s_t=(h_t,z_t,m_t) 选出的；
+            # imged_beliefs[t] / imged_prior_states[t] 则是执行 action[t] 后的 s_{t+1}。
+            # 因此 TD 应为 Q(s_t,a_t) -> r_{t+1}+γQ(s_{t+1})，不能用 imged_beliefs[t] 配 action[t]。
+            start_b0 = start_beliefs.reshape(-1, start_beliefs.shape[-1]).unsqueeze(0)
+            start_s0 = start_states.reshape(-1, start_states.shape[-1]).unsqueeze(0)
+            start_m0 = start_map_emb.reshape(-1, start_map_emb.shape[-1]).unsqueeze(0)
 
-            q_next_online = q_net(next_b, next_s, next_m)              # ((H-1)*N, |A|)
-            a_star = q_next_online.argmax(dim=-1, keepdim=True)        # ((H-1)*N, 1)
+            cur_b_seq = torch.cat([start_b0, imged_beliefs[:-1]], dim=0)       # s_0...s_{H-1}
+            cur_s_seq = torch.cat([start_s0, imged_prior_states[:-1]], dim=0)  # z_0...z_{H-1}
+            cur_m_seq = torch.cat([start_m0, imged_map_emb[:-1]], dim=0)       # m_0...m_{H-1}
+
+            next_b = imged_beliefs.reshape(-1, imged_beliefs.shape[-1])
+            next_s = imged_prior_states.reshape(-1, imged_prior_states.shape[-1])
+            next_m = imged_map_emb.reshape(-1, imged_map_emb.shape[-1])
+
+            q_next_online = q_net(next_b, next_s, next_m)              # (H*N, |A|)
+            a_star = q_next_online.argmax(dim=-1, keepdim=True)        # (H*N, 1)
             q_next_target = target_q_net(next_b, next_s, next_m).gather(1, a_star).squeeze(1)
-            q_next_target = q_next_target.view(H - 1, N)
+            q_next_target = q_next_target.view(H, N)
 
-            # TD 目标 (使用 r̂_{t+1} 对齐 Dreamer 约定: r̂_t 为进入 s_t 的奖励)
-            td_target = imged_reward[1:] + args.discount * imged_cont[1:] * q_next_target
-            # [补丁 1] 硬截断保护 (与 main.py 原 returns.clamp 一致)
+            # r̂ / ĉ 是执行 a_t 后进入 s_{t+1} 的预测量，正好与 imged_*[t] 对齐。
+            td_target = imged_reward + args.discount * imged_cont * q_next_target
             td_target = td_target.clamp(-100.0, 100.0)
 
         # ---------------------------------------------------------------
-        #  4) Q 在线网络前向 (带梯度), 仅对 s_t, a_t 做 gather
+        #  4) Q 在线网络前向 (带梯度), 仅对真正的 s_t, a_t 做 gather
         # ---------------------------------------------------------------
-        cur_b = imged_beliefs[:-1].reshape(-1, imged_beliefs.shape[-1])
-        cur_s = imged_prior_states[:-1].reshape(-1, imged_prior_states.shape[-1])
-        cur_m = imged_map_emb[:-1].reshape(-1, imged_map_emb.shape[-1])
-        # 想象中实际采取的动作 (one-hot) → int index
-        cur_a_idx = imged_actions_onehot[:-1].argmax(dim=-1).reshape(-1)   # ((H-1)*N,)
+        cur_b = cur_b_seq.reshape(-1, cur_b_seq.shape[-1])
+        cur_s = cur_s_seq.reshape(-1, cur_s_seq.shape[-1])
+        cur_m = cur_m_seq.reshape(-1, cur_m_seq.shape[-1])
+        cur_a_idx = imged_actions_onehot.argmax(dim=-1).reshape(-1)   # (H*N,)
 
         with autocast(enabled=use_amp):
-            q_all = q_net(cur_b, cur_s, cur_m)                              # ((H-1)*N, |A|)
+            q_all = q_net(cur_b, cur_s, cur_m)                         # (H*N, |A|)
             q_sa = q_all.gather(1, cur_a_idx.unsqueeze(1)).squeeze(1)
-            q_sa = q_sa.view(H - 1, N)
+            q_sa = q_sa.view(H, N)
             q_loss = F.smooth_l1_loss(q_sa, td_target, reduction='mean')
 
         _q_loss_val = q_loss.item()
@@ -1331,6 +1338,7 @@ for episode in tqdm(
         del imagination_traj, imged_beliefs, imged_prior_states
         del imged_map_emb, imged_actions_onehot, imged_reward, imged_cont
         del q_next_online, a_star, q_next_target, td_target, q_all, q_sa, q_loss
+        del cur_b_seq, cur_s_seq, cur_m_seq, start_b0, start_s0, start_m0
         if start_maps is not None:
             del start_maps
         torch.cuda.empty_cache()
@@ -1646,8 +1654,7 @@ for episode in tqdm(
     # ===============================================================
     _frac = min(1.0, max(0.0, (episode - 1) / max(1, args.q_epsilon_decay_eps)))
     _current_eps = args.q_epsilon_start + _frac * (args.q_epsilon_end - args.q_epsilon_start)
-    # update_belief_and_act 中 `explore=True` 时使用 args.action_noise 做 ε-greedy;
-    # 这里直接改写 args.action_noise 为当前 ε, 避免修改 update_belief_and_act.
+    # update_belief_and_act 会把该 ε 传给 QPolicy；随机动作只采样一次。
     args.action_noise = _current_eps
     writer.add_scalar('Train/epsilon', _current_eps, episode)
 

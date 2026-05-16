@@ -655,6 +655,7 @@ class TransitionModel(nn.Module):
             nonterminals: Optional[torch.Tensor] = None,
             map_embeddings: Optional[torch.Tensor] = None,
             map_embeddings_post: Optional[torch.Tensor] = None,
+            deterministic: bool = False,
     ) -> Tuple[
         torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
         torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -712,7 +713,11 @@ class TransitionModel(nn.Module):
             # [防线 3] std 上界 clamp — 防止 softplus 无上界导致想象中 state 采样爆炸
             # 下界 min_std_dev (通常 0.1) 已保证数值稳定, 上界 5.0 保留足够不确定性表达
             prior_std_devs[t + 1] = (F.softplus(_prior_std_dev) + self.min_std_dev).clamp(max=5.0)
-            prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])
+            # 训练/想象默认随机采样；evaluation / deterministic rollout 使用均值，避免同一观测下策略抖动。
+            if deterministic:
+                prior_states[t + 1] = prior_means[t + 1]
+            else:
+                prior_states[t + 1] = prior_means[t + 1] + prior_std_devs[t + 1] * torch.randn_like(prior_means[t + 1])
 
             # [公式 16] Posterior: q(z_{t+1} | h_{t+1}, e_{t+1}, m_{t+1})
             if observations is not None:
@@ -731,9 +736,13 @@ class TransitionModel(nn.Module):
                 posterior_means[t + 1], _posterior_std_dev = torch.chunk(self.fc_state_posterior(hidden), 2, dim=1)
                 # [防线 3] posterior std 同样加上界, 对称处理
                 posterior_std_devs[t + 1] = (F.softplus(_posterior_std_dev) + self.min_std_dev).clamp(max=5.0)
-                posterior_states[t + 1] = (
-                    posterior_means[t + 1] + posterior_std_devs[t + 1] * torch.randn_like(posterior_means[t + 1])
-                )
+                # 训练默认重参数采样；测试/评估用 posterior mean，关闭 latent sampling 噪声。
+                if deterministic:
+                    posterior_states[t + 1] = posterior_means[t + 1]
+                else:
+                    posterior_states[t + 1] = (
+                        posterior_means[t + 1] + posterior_std_devs[t + 1] * torch.randn_like(posterior_means[t + 1])
+                    )
             else:
                 posterior_states[t + 1] = prior_states[t + 1]
                 posterior_means[t + 1] = prior_means[t + 1]
