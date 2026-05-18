@@ -53,17 +53,17 @@ parser.add_argument('--episodes', type=int, default=1000, metavar='E')
 parser.add_argument('--seed-episodes', type=int, default=5)
 parser.add_argument('--collect-interval', type=int, default=100,
                     help='Gradient steps per episode')
-parser.add_argument('--batch-size', type=int, default=16)
+parser.add_argument('--batch-size', type=int, default=8)
 parser.add_argument('--hidden-size', type=int, default=256)
-parser.add_argument('--learning-rate', type=float, default=1e-4)
+parser.add_argument('--learning-rate', type=float, default=5e-5)
 parser.add_argument('--adam-epsilon', type=float, default=1e-7)
 parser.add_argument('--grad-clip-norm', type=float, default=10.0)
 parser.add_argument('--gamma', type=float, default=0.99)
-parser.add_argument('--target-update', type=int, default=1000,
+parser.add_argument('--target-update', type=int, default=2000,
                     help='Target network update interval (gradient steps)')
 parser.add_argument('--eps-start', type=float, default=1.0)
-parser.add_argument('--eps-end', type=float, default=0.05)
-parser.add_argument('--eps-decay-episodes', type=int, default=300,
+parser.add_argument('--eps-end', type=float, default=0.30)
+parser.add_argument('--eps-decay-episodes', type=int, default=500,
                     help='Linear decay episodes (ε_start → ε_end)')
 parser.add_argument('--test', action='store_true')
 parser.add_argument('--test-interval', type=int, default=25)

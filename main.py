@@ -106,9 +106,21 @@ parser.add_argument('--state-size', type=int, default=30, metavar='Z')
 parser.add_argument('--semantic-size', type=int, default=512, metavar='S', help='Semantic feature size (gθ output)')
 parser.add_argument('--map-embedding-size', type=int, default=256, metavar='M', help='Map embedding size (E_m output)')
 parser.add_argument('--action-repeat', type=int, default=1, metavar='R')
-parser.add_argument('--action-noise', type=float, default=0.2, metavar='ε')
 parser.add_argument('--episodes', type=int, default=1000, metavar='E')
 parser.add_argument('--seed-episodes', type=int, default=5, metavar='S')
+# =========================================================================
+#  [WM 预训练] 先只学习 latent/world model, 不更新 planner/Q 网络
+# -------------------------------------------------------------------------
+#  动机: 训练早期 latent representation 不稳定时, planner 过早基于错误 latent
+#  学 Q 会把策略带偏。前 wm-pretrain-episodes 个 episode 只更新世界模型,
+#  环境采集使用随机动作, Q/planner 完全冻结。预训练结束后再进入 WM+D3QN 联合训练。
+# =========================================================================
+parser.add_argument('--wm-pretrain-episodes', type=int, default=15, metavar='WP',
+                    help='Number of warm-up episodes that train only the world model with random actions; Q/planner is not updated.')
+parser.add_argument('--skip-eval-during-wm-pretrain', action='store_true', default=True,
+                    help='Skip policy evaluation during WM-only pretraining because the planner is intentionally untrained.')
+parser.add_argument('--eval-during-wm-pretrain', dest='skip_eval_during_wm_pretrain',
+                    action='store_false', help='Run evaluation even during WM-only pretraining.')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C')
 parser.add_argument('--batch-size', type=int, default=8, metavar='B',
                     help='Batch size per gradient step')
@@ -186,7 +198,7 @@ parser.add_argument('--q-target-update', type=int, default=100,
                     help='Target Q 网络硬同步周期 (单位: 梯度步)')
 parser.add_argument('--q-target-tau', type=float, default=1.0,
                     help='1.0 → hard copy; <1.0 → Polyak soft update')
-parser.add_argument('--q-epsilon-imag', type=float, default=0.3,
+parser.add_argument('--q-epsilon-imag', type=float, default=0.05,
                     help='想象 rollout 中的 ε (固定, 为 Q 提供探索性轨迹)')
 parser.add_argument('--q-epsilon-start', type=float, default=1.0,
                     help='环境采集的 ε 起始值')
@@ -633,7 +645,10 @@ for episode in tqdm(
     total=args.episodes, initial=metrics['episodes'][-1] + 1
 ):
     model_modules = get_all_model_modules()
-    print(f"Training loop EP:{episode}")
+    wm_pretraining = (episode <= args.wm_pretrain_episodes)
+    phase_name = 'WM_PRETRAIN_RANDOM' if wm_pretraining else 'WM_D3QN_JOINT'
+    print(f"Training loop EP:{episode} [{phase_name}]")
+    writer.add_scalar('Train/wm_pretraining', 1.0 if wm_pretraining else 0.0, episode)
 
     losses = []
     for s in tqdm(range(args.collect_interval)):
@@ -1115,6 +1130,18 @@ for episode in tqdm(
         torch.cuda.empty_cache()
 
         # ===============================================================
+        #  [WM 预训练] warm-up 阶段只更新世界模型, 不进入 imagine/Q/planner 更新
+        # ---------------------------------------------------------------
+        #  这样 latent representation、reward/continuation/map/obstacle heads
+        #  先在随机动作数据上稳定下来, 避免 Q 网络过早在错误 latent 上学习。
+        # ===============================================================
+        if wm_pretraining:
+            _loss_items.append(0.0)  # q_loss placeholder; Q/planner intentionally frozen
+            losses.append(_loss_items)
+            torch.cuda.empty_cache()
+            continue
+
+        # ===============================================================
         #  [D3QN 替换] Actor + Value 训练 → D3QN 想象 TD 训练
         # ---------------------------------------------------------------
         #  保留的论文要素:
@@ -1385,7 +1412,7 @@ for episode in tqdm(
     # ===============================================================
     #  Evaluation — [论文 Section V-D] 完整评估指标
     # ===============================================================
-    if episode % args.test_interval == 0:
+    if episode % args.test_interval == 0 and not (wm_pretraining and args.skip_eval_during_wm_pretrain):
         for m in world_model_modules:
             m.eval()
         # [D3QN 替换] actor_model + value_model → q_net (target_q_net 始终 eval, 不需切换)
@@ -1679,16 +1706,22 @@ for episode in tqdm(
 
         pbar = tqdm(range(args.max_episode_length // args.action_repeat))
         for t in pbar:
-            (belief, posterior_state, map_emb, prev_map,
-             action, next_observation, reward, done) = update_belief_and_act(
-                args, env, planner, transition_model, encoder,
-                belief, posterior_state, action, observation,
-                map_encoder=map_encoder,
-                current_map_embedding=map_emb,
-                map_updater=map_updater, prev_map=prev_map,
-                explore=True,
-            )
-            D.append(observation, action.cpu(), reward, done)
+            if wm_pretraining:
+                # [WM 预训练] 数据采集只用随机动作, 不调用 planner/QPolicy。
+                # world model 仍从 replay 中学习 p(s_{t+1}|s_t,a_t), reward, map, obstacle 等。
+                action = env.sample_random_action()
+                next_observation, reward, done = env.step(action)
+            else:
+                (belief, posterior_state, map_emb, prev_map,
+                 action, next_observation, reward, done) = update_belief_and_act(
+                    args, env, planner, transition_model, encoder,
+                    belief, posterior_state, action, observation,
+                    map_encoder=map_encoder,
+                    current_map_embedding=map_emb,
+                    map_updater=map_updater, prev_map=prev_map,
+                    explore=True,
+                )
+            D.append(observation, action.cpu() if torch.is_tensor(action) else action, reward, done)
             total_reward += reward
             observation = next_observation
 
