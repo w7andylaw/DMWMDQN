@@ -1,10 +1,5 @@
-"""
-memory.py — Experience Replay Buffer
-
-修改:
-  - semantic_map 使用 6 通道 (论文公式 9: Mexp, Mrel, Mtrv, Mocc, Mu, Mv)
-  - [L2 修复] 修正值域注释: 各通道值域不同, 非统一 [-1, 1]
-"""
+# Author: Qiwei Wang
+"""Experience replay storage for sequence-based world-model training."""
 
 import numpy as np
 import torch
@@ -19,11 +14,11 @@ class ExperienceReplay:
         self.size = size
 
         if isinstance(observation_size, dict):
-            # 从 observation_size (gym.spaces.Dict) 中提取语义地图形状
+            
             if 'semantic_map' in observation_size:
                 sem_map_shape = observation_size['semantic_map'].shape
             else:
-                # [论文公式 9] 6 通道: Mexp, Mrel, Mtrv, Mocc, Mu, Mv
+                
                 sem_map_shape = (6, 30, 30)
 
             self.observations = {
@@ -31,7 +26,6 @@ class ExperienceReplay:
                 'target': np.empty((size, 3, 64, 64), dtype=np.uint8),
                 'position': np.empty((size, 2), dtype=np.float32),
                 'semantic_map': np.empty((size, *sem_map_shape), dtype=np.float16),
-                # [shield 改造] safety_mask 已移除 — 边界由 hard shield 保证
             }
 
         elif symbolic_env:
@@ -59,7 +53,7 @@ class ExperienceReplay:
             self.observations['target'][self.idx] = postprocess_observation(obs_np['target'], self.bit_depth)
             self.observations['position'][self.idx] = obs_np['position']
             self.observations['semantic_map'][self.idx] = obs_np['semantic_map']
-            # [shield 改造] safety_mask 已移除
+            
 
         elif self.symbolic_env:
             self.observations[self.idx] = observation.numpy()
@@ -68,7 +62,7 @@ class ExperienceReplay:
                 observation.numpy(), self.bit_depth
             )
 
-        # 离散动作: 存储为 int64 索引
+        
         a_np = action.numpy() if torch.is_tensor(action) else np.asarray(action)
         a_np = np.asarray(a_np).flatten()
         if a_np.size == 1:
@@ -93,7 +87,7 @@ class ExperienceReplay:
     def _retrieve_batch(self, idxs, n, L):
         vec_idxs = idxs.transpose().reshape(-1)
 
-        # 离散动作: int64 → one-hot float32
+        
         act_idx = torch.as_tensor(self.actions[vec_idxs], dtype=torch.int64)
         actions_onehot = torch.nn.functional.one_hot(
             act_idx, num_classes=self.action_size
@@ -102,20 +96,20 @@ class ExperienceReplay:
         if isinstance(self.observations, dict):
             obs_batch = {}
 
-            # Image & Target: uint8 → float32 + preprocess
+            
             for key in ['image', 'target']:
                 raw_data = self.observations[key][vec_idxs]
                 tensor_data = torch.as_tensor(raw_data.astype(np.float32))
                 preprocess_observation_(tensor_data, self.bit_depth)
                 obs_batch[key] = tensor_data.reshape(L, n, *tensor_data.shape[1:])
 
-            # Position
+            
             pos_data = self.observations['position'][vec_idxs]
             obs_batch['position'] = torch.as_tensor(pos_data).reshape(L, n, -1)
 
-            # [shield 改造] safety_mask 已移除
+            
 
-            # semantic_map: 存储为 float16, 取出时转 float32
+            
             sem_map_data = self.observations['semantic_map'][vec_idxs]
             sem_map_tensor = torch.as_tensor(sem_map_data.astype(np.float32))
             obs_batch['semantic_map'] = sem_map_tensor.reshape(L, n, *sem_map_tensor.shape[1:])
@@ -140,13 +134,9 @@ class ExperienceReplay:
 
     def sample(self, n, L):
         batch = self._retrieve_batch(np.asarray([self._sample_idx(L) for _ in range(n)]), n, L)
-
-        # [OOM 修复] 不在此处将整个 batch 搬上 GPU.
-        # 返回 CPU tensors, 由训练循环按需搬运, 避免峰值显存过大.
         processed_batch = []
         for item in batch:
             if isinstance(item, dict):
-                # 观测字典: 保持在 CPU, 仅转为 torch tensor
                 processed_batch.append({k: v if torch.is_tensor(v) else torch.as_tensor(v)
                                         for k, v in item.items()})
             else:
