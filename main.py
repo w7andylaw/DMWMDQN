@@ -54,7 +54,7 @@ parser.add_argument(
     help='Environment',
 )
 parser.add_argument('--symbolic-env', action='store_true', help='Symbolic features')
-parser.add_argument('--max-episode-length', type=int, default=1000, metavar='T')
+parser.add_argument('--max-episode-length', type=int, default=500, metavar='T')
 parser.add_argument('--experience-size', type=int, default=1000000, metavar='D',
                     help='Experience replay size')
 parser.add_argument('--cnn-activation-function', type=str, default='relu', choices=dir(F))
@@ -75,7 +75,7 @@ parser.add_argument('--skip-eval-during-wm-pretrain', action='store_true', defau
 parser.add_argument('--eval-during-wm-pretrain', dest='skip_eval_during_wm_pretrain',
                     action='store_false', help='Run evaluation even during WM-only pretraining.')
 parser.add_argument('--collect-interval', type=int, default=100, metavar='C')
-parser.add_argument('--batch-size', type=int, default=8, metavar='B',
+parser.add_argument('--batch-size', type=int, default=16, metavar='B',
                     help='Batch size per gradient step')
 parser.add_argument('--chunk-size', type=int, default=50, metavar='L',
                     help='Chunk length')
@@ -87,7 +87,7 @@ parser.add_argument('--overshooting-kl-beta', type=float, default=0, metavar='β
 parser.add_argument('--overshooting-reward-scale', type=float, default=0, metavar='R')
 parser.add_argument('--global-kl-beta', type=float, default=0, metavar='βg')
 parser.add_argument('--bit-depth', type=int, default=5, metavar='B')
-parser.add_argument('--model-learning-rate', type=float, default=2e-4, metavar='α')
+parser.add_argument('--model-learning-rate', type=float, default=5e-4, metavar='α')
 parser.add_argument('--learning-rate-schedule', type=int, default=0, metavar='αS')
 parser.add_argument('--adam-epsilon', type=float, default=1e-7, metavar='ε')
 parser.add_argument('--grad-clip-norm', type=float, default=10.0, metavar='C')
@@ -130,19 +130,19 @@ parser.add_argument('--reward-symlog', dest='reward_symlog',
 parser.add_argument('--no-reward-symlog', dest='reward_symlog',
                     action='store_false',
                     help='关闭 symlog, reward_model 在原始尺度训练 (论文原始设置).')
-parser.add_argument('--forecast-horizon', type=int, default=5, help='Obstacle forecasting K steps')
+parser.add_argument('--forecast-horizon', type=int, default=3, help='Obstacle forecasting K steps')
 parser.add_argument('--trk-patch-size', type=int, default=5,
                     help='[公式 43] 软质心 patch 大小, 奇数. 建议 3~7.')
 parser.add_argument('--encode-batch', type=int, default=100, metavar='EB',
                     help='Mini-batch size for encoder forward')
 parser.add_argument('--eval-steps', type=int, default=500, metavar='ES')
-parser.add_argument('--q-learning-rate', type=float, default=2e-5, metavar='αQ',
+parser.add_argument('--q-learning-rate', type=float, default=5e-5, metavar='αQ',
                     help='Q-network 学习率')
 parser.add_argument('--q-target-update', type=int, default=100,
                     help='Target Q 网络硬同步周期 (单位: 梯度步)')
 parser.add_argument('--q-target-tau', type=float, default=0.005,
                     help='1.0 → hard copy; <1.0 → Polyak soft update')
-parser.add_argument('--q-epsilon-imag', type=float, default=0.02,
+parser.add_argument('--q-epsilon-imag', type=float, default=0.20,
                     help='想象 rollout 中的 ε')
 parser.add_argument('--q-epsilon-env', type=float, default=0.05,
                     help='Fixed epsilon for QPolicy during real-environment collection after WM pretraining.')
@@ -1339,6 +1339,17 @@ for episode in tqdm(
                 writer.add_scalar('Eval/Occ_IoU', avg_occ_iou, episode)
                 writer.add_scalar('Eval/ADE', avg_ade, episode)
                 writer.add_scalar('Eval/FDE', avg_fde, episode)
+                metrics.setdefault('forecast_eval_episodes', []).append(episode)
+                metrics.setdefault('forecast_Occ_IoU', []).append(avg_occ_iou)
+                metrics.setdefault('forecast_ADE', []).append(avg_ade)
+                metrics.setdefault('forecast_FDE', []).append(avg_fde)
+                lineplot(metrics['forecast_eval_episodes'], metrics['forecast_Occ_IoU'],
+                         'Forecast_Occ_IoU', results_dir)
+                lineplot(metrics['forecast_eval_episodes'], metrics['forecast_ADE'],
+                         'Forecast_ADE', results_dir)
+                lineplot(metrics['forecast_eval_episodes'], metrics['forecast_FDE'],
+                         'Forecast_FDE', results_dir)
+                torch.save(metrics, os.path.join(results_dir, 'metrics.pth'))
 
         for m in world_model_modules:
             m.train()

@@ -245,7 +245,7 @@ class UAVNavigationEnv(gym.Env):
         reward_rel_scale=1.0,         
         reward_risk_scale=0.03,
         reward_explore_scale=0.02,     
-        reward_revisit_penalty=-0.02, 
+        reward_revisit_penalty=-0.02,
         reward_position_scale=0.1,   
         reach_radius=5,
         similarity_reward_scale=0.0,

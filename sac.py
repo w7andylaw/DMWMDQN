@@ -28,7 +28,7 @@ parser.add_argument('--disable-cuda', action='store_true')
 parser.add_argument('--env', type=str, default='UAV-v0',
                     choices=GYM_ENVS + CONTROL_SUITE_ENVS + ['UAV-v0'])
 parser.add_argument('--symbolic-env', action='store_true')
-parser.add_argument('--max-episode-length', type=int, default=1000)
+parser.add_argument('--max-episode-length', type=int, default=500)
 parser.add_argument('--experience-size', type=int, default=500000,
                     help='Replay buffer size')
 parser.add_argument('--action-repeat', type=int, default=1)
@@ -37,7 +37,7 @@ parser.add_argument('--episodes', type=int, default=1000, metavar='E')
 parser.add_argument('--seed-episodes', type=int, default=5)
 parser.add_argument('--collect-interval', type=int, default=100,
                     help='Gradient steps per episode')
-parser.add_argument('--batch-size', type=int, default=8)
+parser.add_argument('--batch-size', type=int, default=16)
 parser.add_argument('--hidden-size', type=int, default=256)
 parser.add_argument('--actor-lr', type=float, default=1e-5)
 parser.add_argument('--critic-lr', type=float, default=2e-5)
@@ -49,7 +49,7 @@ parser.add_argument('--tau', type=float, default=0.005,
                     help='Polyak soft-update coefficient for target critics')
 parser.add_argument('--init-alpha', type=float, default=0.01,
                     help='Initial entropy temperature')
-parser.add_argument('--target-entropy', type=float, default=None,
+parser.add_argument('--target-entropy', type=float, default=0.5,
                     help='Target entropy. Default: 0.30 * log(action_size).')
 parser.add_argument('--stochastic-eval', action='store_true',
                     help='Sample from policy during evaluation instead of argmax.')
