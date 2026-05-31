@@ -87,11 +87,11 @@ parser.add_argument('--overshooting-kl-beta', type=float, default=0, metavar='β
 parser.add_argument('--overshooting-reward-scale', type=float, default=0, metavar='R')
 parser.add_argument('--global-kl-beta', type=float, default=0, metavar='βg')
 parser.add_argument('--bit-depth', type=int, default=5, metavar='B')
-parser.add_argument('--model-learning-rate', type=float, default=5e-4, metavar='α')
+parser.add_argument('--model-learning-rate', type=float, default=2e-4, metavar='α')
 parser.add_argument('--learning-rate-schedule', type=int, default=0, metavar='αS')
 parser.add_argument('--adam-epsilon', type=float, default=1e-7, metavar='ε')
 parser.add_argument('--grad-clip-norm', type=float, default=10.0, metavar='C')
-parser.add_argument('--planning-horizon', type=int, default=3, metavar='H',
+parser.add_argument('--planning-horizon', type=int, default=5, metavar='H',
                     help='Planning horizon for imagination rollout length.')
 parser.add_argument('--n-steps', type=int, default=1, metavar='N',
                     help='N-step TD horizon for Q/planner update. '
@@ -136,15 +136,15 @@ parser.add_argument('--trk-patch-size', type=int, default=5,
 parser.add_argument('--encode-batch', type=int, default=100, metavar='EB',
                     help='Mini-batch size for encoder forward')
 parser.add_argument('--eval-steps', type=int, default=500, metavar='ES')
-parser.add_argument('--q-learning-rate', type=float, default=5e-5, metavar='αQ',
+parser.add_argument('--q-learning-rate', type=float, default=2e-5, metavar='αQ',
                     help='Q-network 学习率')
 parser.add_argument('--q-target-update', type=int, default=100,
                     help='Target Q 网络硬同步周期 (单位: 梯度步)')
 parser.add_argument('--q-target-tau', type=float, default=0.005,
                     help='1.0 → hard copy; <1.0 → Polyak soft update')
-parser.add_argument('--q-epsilon-imag', type=float, default=0.20,
+parser.add_argument('--q-epsilon-imag', type=float, default=0.01,
                     help='想象 rollout 中的 ε')
-parser.add_argument('--q-epsilon-env', type=float, default=0.05,
+parser.add_argument('--q-epsilon-env', type=float, default=0.03,
                     help='Fixed epsilon for QPolicy during real-environment collection after WM pretraining.')
 args = parser.parse_args()
 args.overshooting_distance = min(args.chunk_size, args.overshooting_distance)
